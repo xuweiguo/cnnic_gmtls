@@ -280,6 +280,8 @@ func main() {
 			return fmt.Errorf("gm tls handshake failed: %w", err)
 		}
 		defer tlsConn.Close()
+		state := tlsConn.ConnectionState()
+		fmt.Printf("Negotiated TLS: version=0x%04x cipherSuite=0x%04x\n", state.Version, state.CipherSuite)
 		rw = tlsConn
 
 		// 读取 greeting
