@@ -19,6 +19,19 @@ type ecPrivateKey struct {
 	PublicKey     asn1.BitString        `asn1:"optional,explicit,tag:1"`
 }
 
+func isEncryptedPEMBlock(block *pem.Block) bool {
+	if block == nil {
+		return false
+	}
+	if block.Headers["Proc-Type"] == "4,ENCRYPTED" {
+		return true
+	}
+	if block.Headers["DEK-Info"] != "" {
+		return true
+	}
+	return false
+}
+
 func LoadCertificateFromPEM(path string) (*Certificate, error) {
 	certs, err := LoadCertificatesFromPEM(path)
 	if err != nil {
@@ -66,36 +79,7 @@ func LoadSM2PrivateKeyFromPEM(path, password string) (*PrivateKey, error) {
 	if err != nil {
 		return nil, err
 	}
-	block, _ := pem.Decode(b)
-	if block == nil {
-		return nil, errors.New("gmtls: failed to decode private key PEM")
-	}
-
-	der := block.Bytes
-	if smx509.IsEncryptedPEMBlock(block) {
-		if password == "" {
-			return nil, errors.New("gmtls: encrypted private key, password required")
-		}
-		der, err = smx509.DecryptPEMBlock(block, []byte(password))
-		if err != nil {
-			return nil, err
-		}
-	}
-
-	var ecKey ecPrivateKey
-	if _, err := asn1.Unmarshal(der, &ecKey); err != nil {
-		return nil, err
-	}
-	if len(ecKey.PrivateKey) == 0 {
-		return nil, errors.New("gmtls: empty private key")
-	}
-
-	d := new(big.Int).SetBytes(ecKey.PrivateKey)
-	if d.Sign() <= 0 {
-		return nil, errors.New("gmtls: invalid private key")
-	}
-
-	return &PrivateKey{D: d}, nil
+	return parseSM2PrivateKeyFromPEMBytes(b, password)
 }
 
 // LoadSM2PrivateKeyFromReader allows loading a PEM key from any reader.
@@ -104,13 +88,18 @@ func LoadSM2PrivateKeyFromReader(r io.Reader, password string) (*PrivateKey, err
 	if err != nil {
 		return nil, err
 	}
+	return parseSM2PrivateKeyFromPEMBytes(b, password)
+}
+
+func parseSM2PrivateKeyFromPEMBytes(b []byte, password string) (*PrivateKey, error) {
 	block, _ := pem.Decode(b)
 	if block == nil {
 		return nil, errors.New("gmtls: failed to decode private key PEM")
 	}
 
 	der := block.Bytes
-	if smx509.IsEncryptedPEMBlock(block) {
+	var err error
+	if isEncryptedPEMBlock(block) {
 		if password == "" {
 			return nil, errors.New("gmtls: encrypted private key, password required")
 		}

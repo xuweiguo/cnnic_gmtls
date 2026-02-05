@@ -4,7 +4,6 @@ import (
 	"bytes"
 	"encoding/binary"
 	"errors"
-	"math/big"
 )
 
 // ============= TLS 握手消息类型 =============
@@ -110,9 +109,7 @@ func (m *clientHelloMsg) marshal() []byte {
 	// 写入长度
 	data := buf.Bytes()
 	length := len(data) - 4 // 减去类型和长度字段
-	data[1] = byte(length >> 16)
-	data[2] = byte(length >> 8)
-	data[3] = byte(length)
+	writeUint24(data[1:4], length)
 
 	return data
 }
@@ -277,9 +274,7 @@ func (m *serverHelloMsg) marshal() []byte {
 	// 写入长度
 	data := buf.Bytes()
 	length := len(data) - 4
-	data[1] = byte(length >> 16)
-	data[2] = byte(length >> 8)
-	data[3] = byte(length)
+	writeUint24(data[1:4], length)
 
 	return data
 }
@@ -363,174 +358,6 @@ func (m *serverHelloMsg) unmarshal(data []byte) error {
 	return nil
 }
 
-// certificateMsg TLS Certificate 消息
-type certificateMsg struct {
-	Certificate *Certificate
-}
-
-// marshal 序列化 Certificate 消息
-func (m *certificateMsg) marshal() []byte {
-	var certs [][]byte
-	if m.Certificate != nil {
-		if len(m.Certificate.Chain) > 0 {
-			certs = m.Certificate.Chain
-		} else if len(m.Certificate.Raw) > 0 {
-			certs = [][]byte{m.Certificate.Raw}
-		}
-	}
-
-	listLen := 0
-	for _, cert := range certs {
-		listLen += 3 + len(cert)
-	}
-	msgLen := 3 + listLen
-
-	data := make([]byte, 4+msgLen)
-	data[0] = typeCertificate
-	writeUint24(data[1:4], msgLen)
-	writeUint24(data[4:7], listLen)
-
-	off := 7
-	for _, cert := range certs {
-		writeUint24(data[off:off+3], len(cert))
-		off += 3
-		copy(data[off:off+len(cert)], cert)
-		off += len(cert)
-	}
-
-	return data
-}
-
-// unmarshal 反序列化 Certificate 消息
-func (m *certificateMsg) unmarshal(data []byte) error {
-	if data[0] != typeCertificate {
-		return errors.New("gmtls: not a Certificate")
-	}
-	if len(data) < 7 {
-		return errors.New("gmtls: invalid Certificate")
-	}
-
-	msgLen := readUint24(data[1:4])
-	if len(data) < 4+msgLen {
-		return errors.New("gmtls: truncated Certificate")
-	}
-
-	off := 4
-	listLen := readUint24(data[off : off+3])
-	off += 3
-	if listLen == 0 {
-		m.Certificate = nil
-		return nil
-	}
-	if len(data) < off+listLen {
-		return errors.New("gmtls: invalid Certificate list length")
-	}
-
-	end := off + listLen
-	var chain [][]byte
-	for off < end {
-		if end-off < 3 {
-			return errors.New("gmtls: invalid Certificate entry length")
-		}
-		certLen := readUint24(data[off : off+3])
-		off += 3
-		if end-off < certLen {
-			return errors.New("gmtls: truncated Certificate entry")
-		}
-		certRaw := make([]byte, certLen)
-		copy(certRaw, data[off:off+certLen])
-		off += certLen
-		chain = append(chain, certRaw)
-	}
-	if len(chain) == 0 {
-		m.Certificate = nil
-		return nil
-	}
-	m.Certificate = &Certificate{
-		Raw:   chain[0],
-		Chain: chain,
-	}
-	return nil
-}
-
-// serverHelloDoneMsg TLS ServerHelloDone 消息
-type serverHelloDoneMsg struct{}
-
-// marshal 序列化 ServerHelloDone 消息
-func (m *serverHelloDoneMsg) marshal() []byte {
-	return []byte{typeServerHelloDone, 0, 0, 0}
-}
-
-// clientKeyExchangeMsg TLS ClientKeyExchange 消息
-type clientKeyExchangeMsg struct {
-	PublicKey *PublicKey
-}
-
-// marshal 序列化 ClientKeyExchange 消息
-func (m *clientKeyExchangeMsg) marshal() []byte {
-	var buf bytes.Buffer
-	buf.WriteByte(typeClientKeyExchange)
-	lengthOffset := buf.Len()
-	buf.Write([]byte{0, 0, 0})
-
-	// 公钥编码 (简化: 64字节未压缩格式)
-	pubKey := make([]byte, 1+64)
-	pubKey[0] = 0x04 // 未压缩
-	xBytes := m.PublicKey.X.Bytes()
-	yBytes := m.PublicKey.Y.Bytes()
-	copy(pubKey[1+32-len(xBytes):33], xBytes)
-	copy(pubKey[33+32-len(yBytes):65], yBytes)
-
-	// 长度
-	binary.Write(&buf, binary.BigEndian, uint16(len(pubKey)))
-
-	// 公钥
-	buf.Write(pubKey)
-
-	data := buf.Bytes()
-	length := len(data) - 4
-	writeUint24(data[lengthOffset:lengthOffset+3], length)
-
-	return data
-}
-
-// unmarshal 反序列化 ClientKeyExchange 消息
-func (m *clientKeyExchangeMsg) unmarshal(data []byte) error {
-	if data[0] != typeClientKeyExchange {
-		return errors.New("gmtls: not a ClientKeyExchange")
-	}
-
-	// 解析公钥
-	if len(data) < 6 {
-		return errors.New("gmtls: invalid ClientKeyExchange")
-	}
-	msgLen := readUint24(data[1:4])
-	if len(data) < 4+msgLen {
-		return errors.New("gmtls: truncated ClientKeyExchange")
-	}
-	offset := 4
-	if len(data) < offset+2 {
-		return errors.New("gmtls: invalid public key length")
-	}
-	keyLen := int(binary.BigEndian.Uint16(data[offset : offset+2]))
-	offset += 2
-	if len(data) < offset+keyLen {
-		return errors.New("gmtls: invalid public key size")
-	}
-	if data[offset] != 0x04 {
-		return errors.New("gmtls: invalid public key format")
-	}
-
-	if keyLen != 65 {
-		return errors.New("gmtls: unsupported public key length")
-	}
-	x := new(big.Int).SetBytes(data[offset+1 : offset+33])
-	y := new(big.Int).SetBytes(data[offset+33 : offset+65])
-
-	m.PublicKey = &PublicKey{X: x, Y: y}
-	return nil
-}
-
 // finishedMsg TLS Finished 消息
 type finishedMsg struct {
 	VerifyData []byte
@@ -549,9 +376,7 @@ func (m *finishedMsg) marshal() []byte {
 
 	data := buf.Bytes()
 	length := len(data) - 4
-	data[1] = byte(length >> 16)
-	data[2] = byte(length >> 8)
-	data[3] = byte(length)
+	writeUint24(data[1:4], length)
 
 	return data
 }
@@ -563,287 +388,6 @@ func (m *finishedMsg) unmarshal(data []byte) error {
 	}
 
 	m.VerifyData = data[4:]
-	return nil
-}
-
-// ============= TLS 1.2 ServerKeyExchange 消息 =============
-
-// serverKeyExchangeMsg TLS 1.2 ServerKeyExchange 消息
-// 用于 SM2DHE 密钥交换，服务端发送临时公钥和签名
-type serverKeyExchangeMsg struct {
-	// 临时公钥（未压缩格式）
-	EphemeralPublicKey *PublicKey
-	// 签名（对 ClientHello.random 和 ServerHello.random 的签名）
-	Signature []byte
-}
-
-// marshal 序列化 ServerKeyExchange 消息
-func (m *serverKeyExchangeMsg) marshal() []byte {
-	var buf bytes.Buffer
-	buf.WriteByte(typeServerKeyExchange)
-
-	// 长度占位
-	lengthOffset := buf.Len()
-	buf.Write([]byte{0, 0, 0})
-
-	// 公钥编码（未压缩格式 0x04 + 64字节）
-	buf.WriteByte(0x04)
-	xBytes := m.EphemeralPublicKey.X.Bytes()
-	yBytes := m.EphemeralPublicKey.Y.Bytes()
-	buf.Write(make([]byte, 32-len(xBytes)))
-	buf.Write(xBytes)
-	buf.Write(make([]byte, 32-len(yBytes)))
-	buf.Write(yBytes)
-
-	// 签名算法（SM2 with SM3）
-	binary.Write(&buf, binary.BigEndian, uint16(0x0100)) // sm2_sig_sm3
-
-	// 签名
-	binary.Write(&buf, binary.BigEndian, uint16(len(m.Signature)))
-	buf.Write(m.Signature)
-
-	// 更新长度
-	data := buf.Bytes()
-	length := len(data) - 4
-	data[lengthOffset] = byte(length >> 16)
-	data[lengthOffset+1] = byte(length >> 8)
-	data[lengthOffset+2] = byte(length)
-
-	return data
-}
-
-// unmarshal 反序列化 ServerKeyExchange 消息
-func (m *serverKeyExchangeMsg) unmarshal(data []byte) error {
-	if data[0] != typeServerKeyExchange {
-		return errors.New("gmtls: not a ServerKeyExchange")
-	}
-
-	offset := 4 // 跳过消息头
-
-	// 解析公钥
-	if offset >= len(data) || data[offset] != 0x04 {
-		return errors.New("gmtls: invalid public key format")
-	}
-	offset++
-
-	if offset+64 > len(data) {
-		return errors.New("gmtls: invalid public key length")
-	}
-
-	x := new(big.Int).SetBytes(data[offset : offset+32])
-	y := new(big.Int).SetBytes(data[offset+32 : offset+64])
-	m.EphemeralPublicKey = &PublicKey{X: x, Y: y}
-	offset += 64
-
-	// 解析签名算法
-	if offset+2 > len(data) {
-		return errors.New("gmtls: invalid signature algorithm")
-	}
-	// algorithm := binary.BigEndian.Uint16(data[offset : offset+2])
-	offset += 2
-
-	// 解析签名长度和签名
-	if offset+2 > len(data) {
-		return errors.New("gmtls: invalid signature length")
-	}
-	sigLen := int(binary.BigEndian.Uint16(data[offset : offset+2]))
-	offset += 2
-
-	if offset+sigLen > len(data) {
-		return errors.New("gmtls: signature length mismatch")
-	}
-	m.Signature = data[offset : offset+sigLen]
-
-	return nil
-}
-
-// ============= TLS 1.2 CertificateRequest 消息 =============
-
-// certificateRequestMsg TLS 1.2 CertificateRequest 消息
-// 请求客户端发送证书
-type certificateRequestMsg struct {
-	// 证书类型
-	CertificateTypes []uint8
-	// 签名算法
-	SignatureAlgorithms []uint16
-	// 可接受的 CA 名称
-	CertificateAuthorities [][]byte
-}
-
-// marshal 序列化 CertificateRequest 消息
-func (m *certificateRequestMsg) marshal() []byte {
-	var buf bytes.Buffer
-	buf.WriteByte(typeCertificateRequest)
-
-	// 长度占位
-	lengthOffset := buf.Len()
-	buf.Write([]byte{0, 0, 0})
-
-	// 证书类型
-	binary.Write(&buf, binary.BigEndian, uint8(len(m.CertificateTypes)))
-	for _, certType := range m.CertificateTypes {
-		buf.WriteByte(certType)
-	}
-
-	// 签名算法
-	binary.Write(&buf, binary.BigEndian, uint16(len(m.SignatureAlgorithms)*2))
-	for _, alg := range m.SignatureAlgorithms {
-		binary.Write(&buf, binary.BigEndian, alg)
-	}
-
-	// CA 名称
-	caTotalLen := 0
-	for _, ca := range m.CertificateAuthorities {
-		caTotalLen += 2 + len(ca)
-	}
-	binary.Write(&buf, binary.BigEndian, uint16(caTotalLen))
-	for _, ca := range m.CertificateAuthorities {
-		binary.Write(&buf, binary.BigEndian, uint16(len(ca)))
-		buf.Write(ca)
-	}
-
-	// 更新长度
-	data := buf.Bytes()
-	length := len(data) - 4
-	data[lengthOffset] = byte(length >> 16)
-	data[lengthOffset+1] = byte(length >> 8)
-	data[lengthOffset+2] = byte(length)
-
-	return data
-}
-
-// unmarshal 反序列化 CertificateRequest 消息
-func (m *certificateRequestMsg) unmarshal(data []byte) error {
-	if data[0] != typeCertificateRequest {
-		return errors.New("gmtls: not a CertificateRequest")
-	}
-
-	offset := 4 // 跳过消息头
-
-	// 解析证书类型
-	if offset >= len(data) {
-		return errors.New("gmtls: invalid certificate types")
-	}
-	certTypesLen := int(data[offset])
-	offset++
-
-	if offset+certTypesLen > len(data) {
-		return errors.New("gmtls: certificate types length mismatch")
-	}
-	m.CertificateTypes = make([]uint8, certTypesLen)
-	copy(m.CertificateTypes, data[offset:offset+certTypesLen])
-	offset += certTypesLen
-
-	// 解析签名算法
-	if offset+2 > len(data) {
-		return errors.New("gmtls: invalid signature algorithms length")
-	}
-	sigAlgsLen := int(binary.BigEndian.Uint16(data[offset : offset+2]))
-	offset += 2
-
-	if offset+sigAlgsLen > len(data) {
-		return errors.New("gmtls: signature algorithms length mismatch")
-	}
-	m.SignatureAlgorithms = make([]uint16, sigAlgsLen/2)
-	for i := 0; i < sigAlgsLen/2; i++ {
-		m.SignatureAlgorithms[i] = binary.BigEndian.Uint16(data[offset : offset+2])
-		offset += 2
-	}
-
-	// 解析 CA 名称
-	if offset+2 > len(data) {
-		return errors.New("gmtls: invalid CA names length")
-	}
-	caNamesLen := int(binary.BigEndian.Uint16(data[offset : offset+2]))
-	offset += 2
-	if offset+caNamesLen > len(data) {
-		return errors.New("gmtls: CA names length mismatch")
-	}
-	end := offset + caNamesLen
-	var cas [][]byte
-	for offset < end {
-		if offset+2 > end {
-			return errors.New("gmtls: invalid CA name entry length")
-		}
-		nameLen := int(binary.BigEndian.Uint16(data[offset : offset+2]))
-		offset += 2
-		if offset+nameLen > end {
-			return errors.New("gmtls: CA name entry truncated")
-		}
-		name := make([]byte, nameLen)
-		copy(name, data[offset:offset+nameLen])
-		offset += nameLen
-		cas = append(cas, name)
-	}
-	m.CertificateAuthorities = cas
-
-	return nil
-}
-
-// ============= TLS 1.2 CertificateVerify 消息 =============
-
-// certificateVerifyMsgTLS12 TLS 1.2 CertificateVerify 消息
-// 客户端发送，证明自己拥有私钥
-type certificateVerifyMsgTLS12 struct {
-	// 签名算法
-	SignatureAlgorithm uint16
-	// 签名
-	Signature []byte
-}
-
-// marshal 序列化 CertificateVerify 消息
-func (m *certificateVerifyMsgTLS12) marshal() []byte {
-	var buf bytes.Buffer
-	buf.WriteByte(typeCertificateVerify)
-
-	// 长度占位
-	lengthOffset := buf.Len()
-	buf.Write([]byte{0, 0, 0})
-
-	// 签名算法（SM2 with SM3）
-	binary.Write(&buf, binary.BigEndian, m.SignatureAlgorithm)
-
-	// 签名
-	binary.Write(&buf, binary.BigEndian, uint16(len(m.Signature)))
-	buf.Write(m.Signature)
-
-	// 更新长度
-	data := buf.Bytes()
-	length := len(data) - 4
-	data[lengthOffset] = byte(length >> 16)
-	data[lengthOffset+1] = byte(length >> 8)
-	data[lengthOffset+2] = byte(length)
-
-	return data
-}
-
-// unmarshal 反序列化 CertificateVerify 消息
-func (m *certificateVerifyMsgTLS12) unmarshal(data []byte) error {
-	if data[0] != typeCertificateVerify {
-		return errors.New("gmtls: not a CertificateVerify")
-	}
-
-	offset := 4 // 跳过消息头
-
-	// 解析签名算法
-	if offset+2 > len(data) {
-		return errors.New("gmtls: invalid signature algorithm")
-	}
-	m.SignatureAlgorithm = binary.BigEndian.Uint16(data[offset : offset+2])
-	offset += 2
-
-	// 解析签名
-	if offset+2 > len(data) {
-		return errors.New("gmtls: invalid signature length")
-	}
-	sigLen := int(binary.BigEndian.Uint16(data[offset : offset+2]))
-	offset += 2
-
-	if offset+sigLen > len(data) {
-		return errors.New("gmtls: signature length mismatch")
-	}
-	m.Signature = data[offset : offset+sigLen]
-
 	return nil
 }
 
@@ -884,9 +428,7 @@ func (m *encryptedExtensionsMsg) marshal() []byte {
 
 	data := buf.Bytes()
 	length := len(data) - 4
-	data[lengthOffset] = byte(length >> 16)
-	data[lengthOffset+1] = byte(length >> 8)
-	data[lengthOffset+2] = byte(length)
+	writeUint24(data[lengthOffset:lengthOffset+3], length)
 
 	return data
 }
@@ -901,7 +443,7 @@ func (m *encryptedExtensionsMsg) unmarshal(data []byte) error {
 		return errors.New("gmtls: invalid EncryptedExtensions message")
 	}
 
-	msgLen := int(data[1])<<16 | int(data[2])<<8 | int(data[3])
+	msgLen := readUint24(data[1:4])
 	if len(data) < 4+msgLen {
 		return errors.New("gmtls: EncryptedExtensions message too short")
 	}
@@ -962,9 +504,7 @@ func (m *certificateVerifyMsg) marshal() []byte {
 
 	data := buf.Bytes()
 	length := len(data) - 4
-	data[lengthOffset] = byte(length >> 16)
-	data[lengthOffset+1] = byte(length >> 8)
-	data[lengthOffset+2] = byte(length)
+	writeUint24(data[lengthOffset:lengthOffset+3], length)
 
 	return data
 }

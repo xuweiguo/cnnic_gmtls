@@ -3,8 +3,6 @@ package gmtls
 import (
 	"encoding/binary"
 	"errors"
-
-	"github.com/emmansun/gmsm/smx509"
 )
 
 func marshalCertificateTLS13(cert *Certificate, context []byte) []byte {
@@ -23,9 +21,7 @@ func marshalCertificateTLS13(cert *Certificate, context []byte) []byte {
 
 	data := make([]byte, 4+msgLen)
 	data[0] = typeCertificate
-	data[1] = byte(msgLen >> 16)
-	data[2] = byte(msgLen >> 8)
-	data[3] = byte(msgLen)
+	writeUint24(data[1:4], msgLen)
 
 	off := 4
 	if ctxLen > 255 {
@@ -40,17 +36,13 @@ func marshalCertificateTLS13(cert *Certificate, context []byte) []byte {
 	}
 
 	// certificate_list length (3 bytes)
-	data[off] = byte(totalEntriesLen >> 16)
-	data[off+1] = byte(totalEntriesLen >> 8)
-	data[off+2] = byte(totalEntriesLen)
+	writeUint24(data[off:off+3], totalEntriesLen)
 	off += 3
 
 	for _, c := range certList {
 		certLen := len(c)
 		// certificate entry length (3 bytes)
-		data[off] = byte(certLen >> 16)
-		data[off+1] = byte(certLen >> 8)
-		data[off+2] = byte(certLen)
+		writeUint24(data[off:off+3], certLen)
 		off += 3
 		copy(data[off:], c)
 		off += certLen
@@ -79,7 +71,7 @@ func parseCertificateTLS13(data []byte) (*Certificate, error) {
 	}
 	off += ctxLen
 
-	listLen := int(data[off])<<16 | int(data[off+1])<<8 | int(data[off+2])
+	listLen := readUint24(data[off : off+3])
 	off += 3
 	if len(data) < off+listLen {
 		return nil, errors.New("gmtls: invalid Certificate list length")
@@ -94,7 +86,7 @@ func parseCertificateTLS13(data []byte) (*Certificate, error) {
 		if entriesEnd-off < 3 {
 			return nil, errors.New("gmtls: invalid Certificate entry length")
 		}
-		certLen := int(data[off])<<16 | int(data[off+1])<<8 | int(data[off+2])
+		certLen := readUint24(data[off : off+3])
 		off += 3
 		if entriesEnd-off < certLen+2 {
 			return nil, errors.New("gmtls: invalid Certificate entry")
@@ -117,14 +109,6 @@ func parseCertificateTLS13(data []byte) (*Certificate, error) {
 	}
 
 	cert := &Certificate{Raw: chain[0], Chain: chain}
-	if debugEnabled {
-		debugf("DEBUG: Certificate chain entries=%d\n", len(chain))
-		for i, der := range chain {
-			if c, err := smx509.ParseCertificate(der); err == nil {
-				debugf("DEBUG: Cert[%d] Subject=%s KeyUsage=0x%x ExtKeyUsage=%v\n", i, c.Subject.String(), c.KeyUsage, c.ExtKeyUsage)
-			}
-		}
-	}
 	if pub, err := ParseSM2PublicKeyFromCertificate(chain[0]); err == nil {
 		cert.PublicKey = pub
 	}

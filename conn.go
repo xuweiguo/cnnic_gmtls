@@ -4,14 +4,11 @@ import (
 	"bytes"
 	"crypto/ecdsa"
 	"crypto/rand"
-	"encoding/asn1"
 	"encoding/binary"
-	"encoding/hex"
 	"errors"
 	"fmt"
 	"hash"
 	"io"
-	"math/big"
 	"net"
 	"time"
 )
@@ -39,6 +36,36 @@ func recordTypeToString(rt recordType) string {
 }
 
 var errHelloRetryRequest = errors.New("gmtls: hello retry request")
+
+func parseAlert(data []byte) (level, desc byte, ok bool) {
+	if len(data) < 2 {
+		return 0, 0, false
+	}
+	return data[0], data[1], true
+}
+
+func isCloseNotify(level, desc byte) bool {
+	return level == 1 && desc == 0
+}
+
+func alertError(data []byte) error {
+	level, desc, ok := parseAlert(data)
+	if !ok {
+		return errors.New("gmtls: received alert")
+	}
+	return fmt.Errorf("gmtls: alert level=%d, description=%d", level, desc)
+}
+
+func alertErrorWithCloseNotify(data []byte) error {
+	level, desc, ok := parseAlert(data)
+	if !ok {
+		return errors.New("gmtls: invalid alert")
+	}
+	if isCloseNotify(level, desc) {
+		return io.EOF
+	}
+	return fmt.Errorf("gmtls: alert level=%d desc=%d", level, desc)
+}
 
 var helloRetryRequestRandom = []byte{
 	0xCF, 0x21, 0xAD, 0x74, 0xE5, 0x9A, 0x61, 0x11,
@@ -80,18 +107,12 @@ func isTLS13InnerTypeByte(b byte) bool {
 func (c *Conn) readTLS13HandshakeMsg() ([]byte, error) {
 	for {
 		if len(c.tls13HandshakeBuf) >= 4 {
-			msgLen := int(c.tls13HandshakeBuf[1])<<16 | int(c.tls13HandshakeBuf[2])<<8 | int(c.tls13HandshakeBuf[3])
+			msgLen := readUint24(c.tls13HandshakeBuf[1:4])
 			total := 4 + msgLen
 			if len(c.tls13HandshakeBuf) >= total {
 				msg := c.tls13HandshakeBuf[:total]
 				c.tls13HandshakeBuf = c.tls13HandshakeBuf[total:]
-				if debugEnabled {
-					debugf("DEBUG: TLS1.3 handshake msg type=%d len=%d\n", msg[0], msgLen)
-				}
 				return msg, nil
-			}
-			if debugEnabled {
-				debugf("DEBUG: TLS1.3 handshake msg type=%d need=%d have=%d\n", c.tls13HandshakeBuf[0], total, len(c.tls13HandshakeBuf))
 			}
 		}
 
@@ -103,10 +124,7 @@ func (c *Conn) readTLS13HandshakeMsg() ([]byte, error) {
 			continue
 		}
 		if rec.Type == recordTypeAlert {
-			if len(rec.Data) >= 2 {
-				return nil, fmt.Errorf("gmtls: alert level=%d, description=%d", rec.Data[0], rec.Data[1])
-			}
-			return nil, errors.New("gmtls: received alert")
+			return nil, alertError(rec.Data)
 		}
 		if rec.Type != recordTypeApplicationData {
 			return nil, fmt.Errorf("gmtls: expected encrypted ApplicationData record, got type=%d", rec.Type)
@@ -119,10 +137,7 @@ func (c *Conn) readTLS13HandshakeMsg() ([]byte, error) {
 				return nil, err
 			}
 			if innerType == recordTypeAlert {
-				if len(stripped) >= 2 {
-					return nil, fmt.Errorf("gmtls: alert level=%d, description=%d", stripped[0], stripped[1])
-				}
-				return nil, errors.New("gmtls: received alert")
+				return nil, alertError(stripped)
 			}
 			if innerType != recordTypeHandshake {
 				return nil, fmt.Errorf("gmtls: unexpected inner content type %d", innerType)
@@ -130,12 +145,6 @@ func (c *Conn) readTLS13HandshakeMsg() ([]byte, error) {
 			plaintext = stripped
 		}
 
-		if debugEnabled && len(plaintext) > 0 {
-			debugf("DEBUG: TLS1.3 append %d bytes, first=%02x\n", len(plaintext), plaintext[0])
-			if len(plaintext) <= 32 {
-				debugf("DEBUG: TLS1.3 append data=%s\n", hex.EncodeToString(plaintext))
-			}
-		}
 		c.tls13HandshakeBuf = append(c.tls13HandshakeBuf, plaintext...)
 		for len(c.tls13HandshakeBuf) > 0 && c.tls13HandshakeBuf[0] == 0 {
 			c.tls13HandshakeBuf = c.tls13HandshakeBuf[1:]
@@ -147,12 +156,62 @@ func trimTLS13Handshake(plaintext []byte) ([]byte, error) {
 	if len(plaintext) < 4 {
 		return nil, errors.New("gmtls: invalid TLS 1.3 handshake message")
 	}
-	msgLen := int(plaintext[1])<<16 | int(plaintext[2])<<8 | int(plaintext[3])
+	msgLen := readUint24(plaintext[1:4])
 	total := 4 + msgLen
 	if len(plaintext) < total {
 		return nil, errors.New("gmtls: truncated TLS 1.3 handshake message")
 	}
 	return plaintext[:total], nil
+}
+
+func parseHandshakeMessage(data []byte) (typ byte, body, rest []byte, err error) {
+	if len(data) < 4 {
+		return 0, nil, nil, errors.New("short handshake header")
+	}
+	ln := readUint24(data[1:4])
+	if len(data) < 4+ln {
+		return 0, nil, nil, errors.New("truncated handshake body")
+	}
+	typ = data[0]
+	body = data[4 : 4+ln]
+	rest = data[4+ln:]
+	return typ, body, rest, nil
+}
+
+func tls13CertVerifySigned(context string, transcriptHash []byte) []byte {
+	signed := make([]byte, 0, 64+len(context)+1+len(transcriptHash))
+	signed = append(signed, bytes.Repeat([]byte{0x20}, 64)...)
+	signed = append(signed, context...)
+	signed = append(signed, 0x00)
+	signed = append(signed, transcriptHash...)
+	return signed
+}
+
+func (c *Conn) unwrapTLS13ApplicationData(data []byte) ([]byte, bool, error) {
+	if len(data) == 0 {
+		return data, false, nil
+	}
+	if !isTLS13InnerTypeByte(data[len(data)-1]) {
+		return data, false, nil
+	}
+
+	stripped, innerType, err := stripTLS13InnerContentType(data)
+	if err != nil {
+		return nil, false, err
+	}
+	switch innerType {
+	case recordTypeApplicationData:
+		return stripped, false, nil
+	case recordTypeAlert:
+		return nil, false, alertErrorWithCloseNotify(stripped)
+	case recordTypeHandshake:
+		if c.handshakeComplete && tls13ConsumeNewSessionTickets(stripped, c) {
+			return nil, true, nil
+		}
+		return nil, false, fmt.Errorf("gmtls: unexpected inner content type %d", innerType)
+	default:
+		return nil, false, fmt.Errorf("gmtls: unexpected inner content type %d", innerType)
+	}
 }
 
 // ============= TLS 连接 =============
@@ -163,10 +222,6 @@ type Conn struct {
 	version     uint16
 	cipherSuite *CipherSuiteInfo
 	config      *Config
-
-	// 密钥材料
-	masterSecret                                                   []byte
-	clientMAC, serverMAC, clientKey, serverKey, clientIV, serverIV []byte
 
 	// 随机数
 	clientRandom, serverRandom [32]byte
@@ -180,13 +235,9 @@ type Conn struct {
 	peerPubKey   *PublicKey
 
 	// 握手状态
-	handshakeBuf      []byte
 	handshakeComplete bool
 	clientHelloSent   bool
 	serverHelloSent   bool
-
-	// 加密/解密
-	clientEnc, serverEnc interface{} // SM4CBCMode 或 SM4GCMMode
 
 	// 读/写
 	in, out    *halfConn
@@ -226,15 +277,9 @@ type Conn struct {
 	clientSigSchemes      []uint16
 	clientSupportedCurves []uint16
 	clientCipherSuites    []uint16
-	tls12StatusRequest    bool
 
 	// TLS 1.3 server-side fields
 	tls13ClientKeyShare *KeyShareEntry
-
-	// TLS 1.2 interop helpers
-	tls12ServerEphemeralPriv *PrivateKey
-	tls12ServerEphemeralPub  *PublicKey
-	tls12ClientCertRequested bool
 }
 
 type halfConn struct {
@@ -254,13 +299,7 @@ func Client(conn net.Conn, config *Config) (*Conn, error) {
 	if config == nil {
 		config = &Config{}
 	}
-	// 确定使用的 TLS 版本
-	var version uint16 = VersionTLS12
-	if config.MaxVersion >= VersionTLS13 {
-		version = VersionTLS13
-	} else if config.MinVersion > VersionTLS12 {
-		version = config.MinVersion
-	}
+	version := uint16(VersionTLS13)
 
 	c := &Conn{
 		conn:     conn,
@@ -311,13 +350,7 @@ func Server(conn net.Conn, config *Config) (*Conn, error) {
 	if config == nil {
 		config = &Config{}
 	}
-	// 确定使用的 TLS 版本
-	var version uint16 = VersionTLS12
-	if config.MaxVersion >= VersionTLS13 {
-		version = VersionTLS13
-	} else if config.MinVersion > VersionTLS12 {
-		version = config.MinVersion
-	}
+	version := uint16(VersionTLS13)
 
 	c := &Conn{
 		conn:     conn,
@@ -382,9 +415,6 @@ type Config struct {
 	// TLS 1.3 session resumption (client)
 	SessionTickets     []TLS13SessionTicket
 	OnNewSessionTicket func(TLS13SessionTicket)
-
-	// ClientAuth requests a client certificate in TLS 1.2 handshakes.
-	ClientAuth bool
 }
 
 func normalizeCipherSuiteID(id uint16) uint16 {
@@ -522,824 +552,13 @@ func parseSupportedVersionsClientHello(data []byte) ([]uint16, error) {
 // ============= 客户端握手 =============
 
 func (c *Conn) clientHandshake() error {
-	// 检查是否支持 TLS 1.3
-	if c.version >= VersionTLS13 {
-		return c.clientHandshakeTLS13()
-	}
-
-	// TLS 1.2 握手
-	// 发送 ClientHello
-	if err := c.sendClientHello(); err != nil {
-		return err
-	}
-
-	// 接收 ServerHello
-	if err := c.readServerHello(); err != nil {
-		return err
-	}
-
-	// 接收 ServerHelloDone (如果有)
-	if err := c.readServerMessages(); err != nil {
-		return err
-	}
-
-	// 如果服务端请求客户端证书，先发送 Certificate
-	if c.tls12ClientCertRequested {
-		if err := c.sendClientCertificateTLS12(); err != nil {
-			return err
-		}
-	}
-
-	// 发送 ClientKeyExchange
-	if err := c.sendClientKeyExchange(); err != nil {
-		return err
-	}
-
-	// 如果发送了客户端证书，发送 CertificateVerify
-	if c.tls12ClientCertRequested && c.localCert != nil && c.localPriv != nil {
-		if err := c.sendCertificateVerifyTLS12(); err != nil {
-			return err
-		}
-	}
-
-	// 发送 ChangeCipherSpec
-	if err := c.sendChangeCipherSpec(); err != nil {
-		return err
-	}
-
-	// 接收 ChangeCipherSpec
-	if err := c.readChangeCipherSpec(); err != nil {
-		return err
-	}
-
-	// 发送 Finished
-	if err := c.sendFinished(); err != nil {
-		return err
-	}
-
-	// 接收 Finished
-	if err := c.readFinished(); err != nil {
-		return err
-	}
-
-	c.handshakeComplete = true
-	return nil
-}
-
-// sendClientHello 发送 ClientHello 消息
-func (c *Conn) sendClientHello() error {
-	// 选择密码套件（优先使用国密密码套件）
-	var cipherSuites []uint16
-	if c.config != nil && len(c.config.CipherSuites) > 0 {
-		cipherSuites = append([]uint16(nil), c.config.CipherSuites...)
-	} else if c.version >= VersionTLS13 {
-		// TLS 1.3 使用国密密码套件
-		cipherSuites = []uint16{
-			TLS_SM4_GCM_SM3, // 0x1306 - SM4-GCM-SM3
-			TLS_SM4_CCM_SM3, // 0x1307 - SM4-CCM-SM3
-		}
-	} else {
-		// TLS 1.2 使用国密密码套件
-		cipherSuites = []uint16{
-			TLS_SM2_WITH_SM4_CBC_SM3,    // 0xE0 - SM2 with SM4-CBC-SM3
-			TLS_SM2DHE_WITH_SM4_CBC_SM3, // 0xE1 - SM2DHE with SM4-CBC-SM3
-			TLS_SM2_WITH_SM4_GCM_SM3,    // 0xE2 - SM2 with SM4-GCM-SM3
-			TLS_SM2DHE_WITH_SM4_GCM_SM3, // 0xE3 - SM2DHE with SM4-GCM-SM3
-		}
-	}
-	c.clientCipherSuites = append([]uint16(nil), cipherSuites...)
-
-	// 构造握手消息
-	hello := &clientHelloMsg{
-		Version:            c.version,
-		Random:             c.clientRandom[:],
-		CipherSuites:       cipherSuites,
-		CompressionMethods: []uint8{0}, // 无压缩
-	}
-
-	// 添加扩展
-	var extensions []Extension
-
-	// 1. SNI (Server Name Indication)
-	if c.clientServerName != "" {
-		extensions = append(extensions, marshalSNIExtension(c.clientServerName))
-	}
-
-	// 2. SignatureAlgorithms
-	sigSchemes := []uint16{
-		PKCS1WithSM2SM3, // SM2 + SM3
-		ECDSAWithSM2SM3, // ECDSA风格的SM2 + SM3
-		PKCS1WithSHA256, // RSA + SHA256
-		PKCS1WithSHA384, // RSA + SHA384
-		Ed25519,         // Ed25519
-	}
-	extensions = append(extensions, marshalSignatureAlgorithmsExtension(sigSchemes))
-
-	// 3. SupportedCurves (椭圆曲线)
-	curves := []uint16{
-		CurveSM2,    // SM2 曲线
-		CurveP256,   // P256
-		CurveX25519, // X25519
-	}
-	extensions = append(extensions, marshalSupportedCurvesExtension(curves))
-
-	// 4. ALPN (Application-Layer Protocol Negotiation)
-	if len(c.peerProtos) > 0 {
-		extensions = append(extensions, marshalALPNExtension(c.peerProtos))
-	}
-
-	// 5. OCSP Stapling (status_request)
-	// 暂时注释掉，因为 BabaSSL 可能不支持
-	// extensions = append(extensions, marshalStatusRequestExtension())
-
-	hello.Extensions = extensions
-
-	// 序列化
-	data := hello.marshal()
-	c.lastClientHello = append([]byte(nil), data...)
-
-	// 作为握手记录发送
-	return c.writeRecord(recordTypeHandshake, data)
-}
-
-// readServerHello 读取 ServerHello 消息
-func (c *Conn) readServerHello() error {
-	// 读取记录
-	rec, err := c.readRecord()
-	if err != nil {
-		return err
-	}
-
-	if rec.Type != recordTypeHandshake {
-		debugf("DEBUG readServerHello: Expected handshake record, got type=%d (%s), version=0x%04x, length=%d\n",
-			rec.Type, recordTypeToString(rec.Type), rec.Version, rec.Length)
-		if rec.Type == 21 && len(rec.Data) >= 2 {
-			debugf("DEBUG: Alert level=%d, description=%d\n", rec.Data[0], rec.Data[1])
-		}
-		return errors.New("gmtls: expected handshake record")
-	}
-
-	// 解析 ServerHello
-	hello := new(serverHelloMsg)
-	if err := hello.unmarshal(rec.Data); err != nil {
-		return err
-	}
-
-	// 保存服务器随机数
-	copy(c.serverRandom[:], hello.Random)
-
-	// 设置密码套件
-	if len(c.clientCipherSuites) > 0 && !clientOfferedCipherSuite(c.clientCipherSuites, hello.CipherSuite) {
-		return fmt.Errorf("gmtls: server selected unsupported cipher suite 0x%04x", hello.CipherSuite)
-	}
-	c.cipherSuite = GetCipherSuiteByID(hello.CipherSuite)
-	if c.cipherSuite == nil {
-		return fmt.Errorf("gmtls: unsupported cipher suite 0x%04x", hello.CipherSuite)
-	}
-	if !cipherSuiteForVersion(c.cipherSuite, c.version) {
-		return fmt.Errorf("gmtls: cipher suite not valid for TLS version 0x%04x", c.version)
-	}
-
-	// 解析扩展（ALPN 协商结果等）
-	for _, ext := range hello.Extensions {
-		switch ext.Type {
-		case extensionALPN:
-			// ALPN 协商结果
-			protocols, err := parseALPNExtension(ext.Data)
-			if err != nil {
-				return err
-			}
-			if len(protocols) == 1 {
-				if len(c.peerProtos) > 0 && !containsString(c.peerProtos, protocols[0]) {
-					return fmt.Errorf("gmtls: server selected unsupported ALPN protocol %q", protocols[0])
-				}
-				c.negotiatedProto = protocols[0]
-			} else if len(protocols) > 1 {
-				return errors.New("gmtls: invalid ALPN protocol list in ServerHello")
-			}
-		}
-	}
-
-	c.serverHelloSent = true
-	return nil
-}
-
-// readServerMessages 读取服务器消息
-func (c *Conn) readServerMessages() error {
-	// 处理 TLS 1.2 服务器消息序列（Certificate, ServerKeyExchange, CertificateRequest, ServerHelloDone）
-	for {
-		rec, err := c.readRecord()
-		if err != nil {
-			return err
-		}
-		if rec.Type != recordTypeHandshake || len(rec.Data) == 0 {
-			return errors.New("gmtls: expected handshake record")
-		}
-
-		switch rec.Data[0] {
-		case typeCertificate:
-			certMsg := new(certificateMsg)
-			if err := certMsg.unmarshal(rec.Data); err != nil {
-				return err
-			}
-			c.peerCert = certMsg.Certificate
-			if c.peerCert != nil {
-				c.peerPubKey = c.peerCert.PublicKey
-				if c.peerPubKey == nil && len(c.peerCert.Raw) > 0 {
-					if pub, err := ParseSM2PublicKeyFromCertificate(c.peerCert.Raw); err == nil {
-						c.peerPubKey = pub
-						c.peerCert.PublicKey = pub
-					}
-				}
-			}
-		case typeServerKeyExchange:
-			msg := new(serverKeyExchangeMsg)
-			if err := msg.unmarshal(rec.Data); err != nil {
-				return err
-			}
-			c.tls12ServerEphemeralPub = msg.EphemeralPublicKey
-
-			// 验证服务端签名（如果可用）
-			if c.config == nil || !c.config.InsecureSkipVerify {
-				if c.peerPubKey == nil {
-					return errors.New("gmtls: missing server public key for ServerKeyExchange verify")
-				}
-				pubBytes := make([]byte, 65)
-				pubBytes[0] = 0x04
-				xBytes := msg.EphemeralPublicKey.X.Bytes()
-				yBytes := msg.EphemeralPublicKey.Y.Bytes()
-				copy(pubBytes[1+32-len(xBytes):33], xBytes)
-				copy(pubBytes[33+32-len(yBytes):65], yBytes)
-				signed := make([]byte, 0, 32+32+len(pubBytes))
-				signed = append(signed, c.clientRandom[:]...)
-				signed = append(signed, c.serverRandom[:]...)
-				signed = append(signed, pubBytes...)
-				sig, err := signatureFromASN1(msg.Signature)
-				if err != nil || !VerifyMessage(c.peerPubKey, signed, sig) {
-					return errors.New("gmtls: ServerKeyExchange signature verification failed")
-				}
-			}
-		case typeCertificateRequest:
-			req := new(certificateRequestMsg)
-			if err := req.unmarshal(rec.Data); err != nil {
-				return err
-			}
-			c.tls12ClientCertRequested = true
-		case typeServerHelloDone:
-			return nil
-		default:
-			return fmt.Errorf("gmtls: unexpected handshake message %d", rec.Data[0])
-		}
-	}
-}
-
-// sendClientKeyExchange 发送 ClientKeyExchange 消息
-func (c *Conn) sendClientKeyExchange() error {
-	// 生成临时密钥对
-	priv, pub, err := GenerateKey()
-	if err != nil {
-		return err
-	}
-
-	// 派生共享密钥
-	peerKey := c.peerPubKey
-	if c.cipherSuite != nil && c.cipherSuite.KeyExchange == "SM2DHE" {
-		if c.tls12ServerEphemeralPub == nil {
-			return errors.New("gmtls: missing server ephemeral key for SM2DHE")
-		}
-		peerKey = c.tls12ServerEphemeralPub
-	}
-	sharedKey := DeriveSharedKey(priv, peerKey)
-	if debugEnabled && len(sharedKey) >= 8 {
-		debugf("DEBUG: client sharedKey=%02x\n", sharedKey[:8])
-	}
-
-	// 计算主密钥
-	c.masterSecret = MasterSecretDerive(sharedKey, c.clientRandom[:], c.serverRandom[:])
-	if debugEnabled && len(c.masterSecret) >= 8 {
-		debugf("DEBUG: client masterSecret=%02x\n", c.masterSecret[:8])
-	}
-
-	// 派生密钥块
-	keyBlock := KeyBlockDerive(c.masterSecret, c.clientRandom[:], c.serverRandom[:], c.cipherSuite)
-	c.clientMAC, c.serverMAC, c.clientKey, c.serverKey, c.clientIV, c.serverIV = ParseKeyBlock(keyBlock, c.cipherSuite)
-	if debugEnabled {
-		if len(c.clientKey) >= 8 && len(c.serverKey) >= 8 {
-			debugf("DEBUG: client keys clientKey=%02x serverKey=%02x\n", c.clientKey[:8], c.serverKey[:8])
-		}
-		if len(c.clientIV) >= 4 && len(c.serverIV) >= 4 {
-			debugf("DEBUG: client IVs clientIV=%02x serverIV=%02x\n", c.clientIV[:4], c.serverIV[:4])
-		}
-	}
-
-	// 初始化加密
-	if c.cipherSuite.IsAEAD {
-		// GCM 模式
-		isTLS13 := c.version >= VersionTLS13
-		c.clientEnc, _ = NewSM4GCMMode(c.clientKey, c.clientIV, true, isTLS13)
-		c.serverEnc, _ = NewSM4GCMMode(c.serverKey, c.serverIV, true, isTLS13)
-	} else {
-		// CBC 模式
-		c.clientEnc, _ = NewSM4CBCMode(c.clientKey, c.clientMAC, c.clientIV, true)
-		c.serverEnc, _ = NewSM4CBCMode(c.serverKey, c.serverMAC, c.serverIV, true)
-	}
-
-	// 设置 halfConn 的加密器（此时还未启用加密）
-	c.in.cipher = c.serverEnc  // 接收使用对方（服务端）的密钥
-	c.out.cipher = c.clientEnc // 发送使用己方（客户端）的密钥
-
-	// 构造消息
-	msg := &clientKeyExchangeMsg{
-		PublicKey: pub,
-	}
-
-	data := msg.marshal()
-	return c.writeRecord(recordTypeHandshake, data)
-}
-
-// sendChangeCipherSpec 发送 ChangeCipherSpec
-func (c *Conn) sendChangeCipherSpec() error {
-	if err := c.writeRecord(recordTypeChangeCipherSpec, []byte{1}); err != nil {
-		return err
-	}
-	// 发送 CCS 后，启用写加密
-	if c.isClient {
-		c.clientEncrypted = true
-	} else {
-		c.serverEncrypted = true
-	}
-	return nil
-}
-
-// readChangeCipherSpec 读取 ChangeCipherSpec
-func (c *Conn) readChangeCipherSpec() error {
-	rec, err := c.readRecord()
-	if err != nil {
-		return err
-	}
-	if rec.Type != recordTypeChangeCipherSpec {
-		return errors.New("gmtls: expected ChangeCipherSpec")
-	}
-	// 接收 CCS 后，启用读加密
-	if c.isClient {
-		// 客户端接收服务端的 CCS，之后服务端发送的数据都将被加密
-		c.serverEncrypted = true
-	} else {
-		// 服务端接收客户端的 CCS，之后客户端发送的数据都将被加密
-		c.clientEncrypted = true
-	}
-	return nil
-}
-
-// sendFinished 发送 Finished 消息
-func (c *Conn) sendFinished() error {
-	// 计算 verify_data
-	verifyData := c.finishedHash(c.isClient)
-
-	msg := &finishedMsg{
-		VerifyData: verifyData,
-	}
-
-	data := msg.marshal()
-	return c.writeRecord(recordTypeHandshake, data)
-}
-
-// readFinished 读取 Finished 消息
-func (c *Conn) readFinished() error {
-	rec, err := c.readRecord()
-	if err != nil {
-		return err
-	}
-
-	if rec.Data[0] != typeFinished {
-		return errors.New("gmtls: expected Finished")
-	}
-
-	msg := new(finishedMsg)
-	if err := msg.unmarshal(rec.Data); err != nil {
-		return err
-	}
-
-	// 验证 verify_data
-	expectedVerifyData := c.finishedHash(!c.isClient)
-	if !bytes.Equal(msg.VerifyData, expectedVerifyData) {
-		return errors.New("gmtls: finished verify data mismatch")
-	}
-
-	return nil
+	return c.clientHandshakeTLS13()
 }
 
 // ============= 服务端握手 =============
 
 func (c *Conn) serverHandshake() error {
-	// 检查是否支持 TLS 1.3
-	if c.version >= VersionTLS13 {
-		return c.serverHandshakeTLS13()
-	}
-
-	// TLS 1.2 握手
-	// 接收 ClientHello
-	if err := c.readClientHello(); err != nil {
-		return err
-	}
-
-	// 发送 ServerHello
-	if err := c.sendServerHello(); err != nil {
-		return err
-	}
-
-	// 发送 Certificate
-	if err := c.sendCertificate(); err != nil {
-		return err
-	}
-
-	// 发送 ServerKeyExchange（SM2DHE）
-	if c.cipherSuite != nil && c.cipherSuite.KeyExchange == "SM2DHE" {
-		if err := c.sendServerKeyExchange(); err != nil {
-			return err
-		}
-	}
-
-	// 可选：请求客户端证书
-	if c.config != nil && c.config.ClientAuth {
-		if err := c.sendCertificateRequest(); err != nil {
-			return err
-		}
-		c.tls12ClientCertRequested = true
-	}
-
-	// 发送 ServerHelloDone
-	if err := c.sendServerHelloDone(); err != nil {
-		return err
-	}
-
-	// 接收客户端证书（如果请求）
-	if c.tls12ClientCertRequested {
-		if err := c.readClientCertificateTLS12(); err != nil {
-			return err
-		}
-	}
-
-	// 接收 ClientKeyExchange
-	if err := c.readClientKeyExchange(); err != nil {
-		return err
-	}
-
-	// 接收 CertificateVerify（如果有客户端证书）
-	if c.tls12ClientCertRequested && c.peerCert != nil && c.peerCert.PublicKey != nil {
-		if err := c.readCertificateVerifyTLS12(); err != nil {
-			return err
-		}
-	}
-
-	// 发送 ChangeCipherSpec
-	if err := c.sendChangeCipherSpec(); err != nil {
-		return err
-	}
-
-	// 接收 ChangeCipherSpec
-	if err := c.readChangeCipherSpec(); err != nil {
-		return err
-	}
-
-	// 发送 Finished
-	if err := c.sendFinished(); err != nil {
-		return err
-	}
-
-	// 接收 Finished
-	if err := c.readFinished(); err != nil {
-		return err
-	}
-
-	c.handshakeComplete = true
-	return nil
-}
-
-func (c *Conn) readClientHello() error {
-	rec, err := c.readRecord()
-	if err != nil {
-		return err
-	}
-
-	if rec.Type != recordTypeHandshake {
-		return errors.New("gmtls: expected handshake")
-	}
-
-	hello := new(clientHelloMsg)
-	if err := hello.unmarshal(rec.Data); err != nil {
-		return err
-	}
-
-	copy(c.clientRandom[:], hello.Random)
-	c.clientCipherSuites = append([]uint16(nil), hello.CipherSuites...)
-
-	// 解析扩展
-	for _, ext := range hello.Extensions {
-		switch ext.Type {
-		case extensionServerName:
-			// SNI
-			serverName, err := parseSNIExtension(ext.Data)
-			if err != nil {
-				return err
-			}
-			if serverName != "" {
-				c.serverName = serverName
-			}
-		case extensionALPN:
-			// ALPN
-			protocols, err := parseALPNExtension(ext.Data)
-			if err != nil {
-				return err
-			}
-			c.peerProtos = protocols
-		case extensionSignatureAlgorithms:
-			// SignatureAlgorithms
-			schemes, err := parseSignatureAlgorithmsExtension(ext.Data)
-			if err != nil {
-				return err
-			}
-			c.clientSigSchemes = schemes
-		case extensionSupportedCurves:
-			// SupportedCurves
-			curves, err := parseSupportedCurvesExtension(ext.Data)
-			if err != nil {
-				return err
-			}
-			c.clientSupportedCurves = curves
-		case extensionStatusRequest:
-			// OCSP Stapling 请求
-			statusType, _, err := parseStatusRequestExtension(ext.Data)
-			if err != nil {
-				return err
-			}
-			if statusType == 1 {
-				c.tls12StatusRequest = true
-			}
-		}
-	}
-
-	// 选择密码套件
-	var serverSuites []uint16
-	if c.config != nil && len(c.config.CipherSuites) > 0 {
-		serverSuites = c.config.CipherSuites
-	} else {
-		serverSuites = []uint16{
-			TLS_SM2_WITH_SM4_CBC_SM3,
-			TLS_SM2DHE_WITH_SM4_CBC_SM3,
-			TLS_SM2_WITH_SM4_GCM_SM3,
-			TLS_SM2DHE_WITH_SM4_GCM_SM3,
-			TLS_SM2_WITH_SM4_CCM_SM3,
-			TLS_SM2DHE_WITH_SM4_CCM_SM3,
-		}
-	}
-	c.cipherSuite = selectCipherSuite(hello.CipherSuites, serverSuites, c.version, c.clientSupportedCurves, c.clientSigSchemes)
-
-	if c.cipherSuite == nil {
-		return errors.New("gmtls: no common cipher suite")
-	}
-
-	// ALPN: 按服务端优先级选择
-	if c.config != nil && len(c.config.NextProtos) > 0 && len(c.peerProtos) > 0 {
-		c.negotiatedProto = selectALPNProtocol(c.config.NextProtos, c.peerProtos)
-	}
-
-	return nil
-}
-
-func (c *Conn) sendServerHello() error {
-	hello := &serverHelloMsg{
-		Version:     c.version,
-		Random:      c.serverRandom[:],
-		CipherSuite: c.cipherSuite.ID,
-	}
-	var extensions []Extension
-	if c.negotiatedProto != "" {
-		extensions = append(extensions, marshalALPNExtension([]string{c.negotiatedProto}))
-	}
-	hello.Extensions = extensions
-
-	data := hello.marshal()
-	return c.writeRecord(recordTypeHandshake, data)
-}
-
-func (c *Conn) sendCertificate() error {
-	if c.localCert == nil {
-		return errors.New("gmtls: missing local certificate")
-	}
-	msg := &certificateMsg{
-		Certificate: c.localCert,
-	}
-
-	data := msg.marshal()
-	return c.writeRecord(recordTypeHandshake, data)
-}
-
-func (c *Conn) sendServerHelloDone() error {
-	msg := &serverHelloDoneMsg{}
-	data := msg.marshal()
-	return c.writeRecord(recordTypeHandshake, data)
-}
-
-// sendServerKeyExchange 发送 TLS 1.2 ServerKeyExchange（SM2DHE）
-func (c *Conn) sendServerKeyExchange() error {
-	// 生成临时密钥对
-	priv, pub, err := GenerateKey()
-	if err != nil {
-		return err
-	}
-	c.tls12ServerEphemeralPriv = priv
-
-	// 组装待签名数据：client_random || server_random || server_ephemeral_pub
-	pubBytes := make([]byte, 65)
-	pubBytes[0] = 0x04
-	xBytes := pub.X.Bytes()
-	yBytes := pub.Y.Bytes()
-	copy(pubBytes[1+32-len(xBytes):33], xBytes)
-	copy(pubBytes[33+32-len(yBytes):65], yBytes)
-	signed := make([]byte, 0, 32+32+len(pubBytes))
-	signed = append(signed, c.clientRandom[:]...)
-	signed = append(signed, c.serverRandom[:]...)
-	signed = append(signed, pubBytes...)
-
-	sig, err := SignMessage(c.localPriv, signed)
-	if err != nil {
-		return err
-	}
-	sigDER, err := signatureToASN1(sig)
-	if err != nil {
-		return err
-	}
-
-	msg := &serverKeyExchangeMsg{
-		EphemeralPublicKey: pub,
-		Signature:          sigDER,
-	}
-	data := msg.marshal()
-	return c.writeRecord(recordTypeHandshake, data)
-}
-
-// sendCertificateRequest 发送 TLS 1.2 CertificateRequest
-func (c *Conn) sendCertificateRequest() error {
-	msg := &certificateRequestMsg{
-		CertificateTypes:    []uint8{1}, // rsa_sign (兼容性取值)
-		SignatureAlgorithms: []uint16{SM2SM3},
-	}
-	data := msg.marshal()
-	return c.writeRecord(recordTypeHandshake, data)
-}
-
-// sendClientCertificateTLS12 发送 TLS 1.2 客户端证书（可为空）
-func (c *Conn) sendClientCertificateTLS12() error {
-	if c.localCert == nil {
-		msg := &certificateMsg{Certificate: nil}
-		data := msg.marshal()
-		return c.writeRecord(recordTypeHandshake, data)
-	}
-	return c.sendCertificate()
-}
-
-// readClientCertificateTLS12 读取 TLS 1.2 客户端证书（可为空）
-func (c *Conn) readClientCertificateTLS12() error {
-	rec, err := c.readRecord()
-	if err != nil {
-		return err
-	}
-	if rec.Type != recordTypeHandshake || len(rec.Data) == 0 || rec.Data[0] != typeCertificate {
-		return errors.New("gmtls: expected client Certificate")
-	}
-	certMsg := new(certificateMsg)
-	if err := certMsg.unmarshal(rec.Data); err != nil {
-		return err
-	}
-	c.peerCert = certMsg.Certificate
-	if c.peerCert != nil {
-		if c.peerCert.PublicKey == nil && len(c.peerCert.Raw) > 0 {
-			if pub, err := ParseSM2PublicKeyFromCertificate(c.peerCert.Raw); err == nil {
-				c.peerCert.PublicKey = pub
-			}
-		}
-		c.peerPubKey = c.peerCert.PublicKey
-	}
-	return nil
-}
-
-// sendCertificateVerifyTLS12 发送 TLS 1.2 CertificateVerify
-func (c *Conn) sendCertificateVerifyTLS12() error {
-	if c.localPriv == nil {
-		return errors.New("gmtls: missing client private key for CertificateVerify")
-	}
-	handshakeHash := SM3(c.handshakeBuf)
-	sig, err := Sign(c.localPriv, handshakeHash[:])
-	if err != nil {
-		return err
-	}
-	sigDER, err := signatureToASN1(sig)
-	if err != nil {
-		return err
-	}
-	msg := &certificateVerifyMsgTLS12{
-		SignatureAlgorithm: 0x0100, // sm2_sig_sm3 (兼容取值)
-		Signature:          sigDER,
-	}
-	data := msg.marshal()
-	return c.writeRecord(recordTypeHandshake, data)
-}
-
-// readCertificateVerifyTLS12 读取并验证 TLS 1.2 CertificateVerify
-func (c *Conn) readCertificateVerifyTLS12() error {
-	rec, err := c.readRecord()
-	if err != nil {
-		return err
-	}
-	if rec.Type != recordTypeHandshake || len(rec.Data) == 0 || rec.Data[0] != typeCertificateVerify {
-		return errors.New("gmtls: expected CertificateVerify")
-	}
-	msg := new(certificateVerifyMsgTLS12)
-	if err := msg.unmarshal(rec.Data); err != nil {
-		return err
-	}
-	if c.config != nil && c.config.InsecureSkipVerify {
-		return nil
-	}
-	if c.peerPubKey == nil {
-		return errors.New("gmtls: missing client public key for CertificateVerify")
-	}
-
-	// CertificateVerify 的签名应覆盖之前所有握手消息（不含自身）
-	transcript := c.handshakeBuf
-	if len(transcript) >= len(rec.Data) {
-		transcript = transcript[:len(transcript)-len(rec.Data)]
-	}
-	h := SM3(transcript)
-	sig, err := signatureFromASN1(msg.Signature)
-	if err != nil || !Verify(c.peerPubKey, h[:], sig) {
-		return errors.New("gmtls: CertificateVerify signature verification failed")
-	}
-	return nil
-}
-
-func (c *Conn) readClientKeyExchange() error {
-	rec, err := c.readRecord()
-	if err != nil {
-		return err
-	}
-
-	if rec.Data[0] != typeClientKeyExchange {
-		return errors.New("gmtls: expected ClientKeyExchange")
-	}
-
-	msg := new(clientKeyExchangeMsg)
-	if err := msg.unmarshal(rec.Data); err != nil {
-		return err
-	}
-
-	// 派生共享密钥
-	priv := c.localPriv
-	if c.cipherSuite != nil && c.cipherSuite.KeyExchange == "SM2DHE" {
-		if c.tls12ServerEphemeralPriv == nil {
-			return errors.New("gmtls: missing server ephemeral key for SM2DHE")
-		}
-		priv = c.tls12ServerEphemeralPriv
-	}
-	sharedKey := DeriveSharedKey(priv, msg.PublicKey)
-	if debugEnabled && len(sharedKey) >= 8 {
-		debugf("DEBUG: server sharedKey=%02x\n", sharedKey[:8])
-	}
-
-	// 计算主密钥
-	c.masterSecret = MasterSecretDerive(sharedKey, c.clientRandom[:], c.serverRandom[:])
-	if debugEnabled && len(c.masterSecret) >= 8 {
-		debugf("DEBUG: server masterSecret=%02x\n", c.masterSecret[:8])
-	}
-
-	// 派生密钥块
-	keyBlock := KeyBlockDerive(c.masterSecret, c.clientRandom[:], c.serverRandom[:], c.cipherSuite)
-	c.clientMAC, c.serverMAC, c.clientKey, c.serverKey, c.clientIV, c.serverIV = ParseKeyBlock(keyBlock, c.cipherSuite)
-	if debugEnabled {
-		if len(c.clientKey) >= 8 && len(c.serverKey) >= 8 {
-			debugf("DEBUG: server keys clientKey=%02x serverKey=%02x\n", c.clientKey[:8], c.serverKey[:8])
-		}
-		if len(c.clientIV) >= 4 && len(c.serverIV) >= 4 {
-			debugf("DEBUG: server IVs clientIV=%02x serverIV=%02x\n", c.clientIV[:4], c.serverIV[:4])
-		}
-	}
-
-	// 初始化加密
-	if c.cipherSuite.IsAEAD {
-		isTLS13 := c.version >= VersionTLS13
-		c.clientEnc, _ = NewSM4GCMMode(c.clientKey, c.clientIV, true, isTLS13)
-		c.serverEnc, _ = NewSM4GCMMode(c.serverKey, c.serverIV, true, isTLS13)
-	} else {
-		c.clientEnc, _ = NewSM4CBCMode(c.clientKey, c.clientMAC, c.clientIV, true)
-		c.serverEnc, _ = NewSM4CBCMode(c.serverKey, c.serverMAC, c.serverIV, true)
-	}
-
-	// 设置 halfConn 的加密器（此时还未启用加密）
-	c.in.cipher = c.clientEnc  // 接收使用对方（客户端）的密钥
-	c.out.cipher = c.serverEnc // 发送使用己方（服务端）的密钥
-
-	return nil
+	return c.serverHandshakeTLS13()
 }
 
 // ============= 记录层读/写 =============
@@ -1349,45 +568,26 @@ func (c *Conn) writeRecord(typ recordType, data []byte) error {
 	var err error
 	outType := typ
 
-	if c.version < VersionTLS13 && typ == recordTypeHandshake && len(data) > 0 && data[0] != typeFinished {
-		// TLS 1.2: accumulate handshake transcript (exclude Finished itself)
-		c.handshakeBuf = append(c.handshakeBuf, data...)
-	}
-
 	// 判断是否需要加密
 	if c.isClient && c.clientEncrypted && c.out.cipher != nil {
 		// 客户端发送，使用客户端加密
-		if cbc, ok := c.out.cipher.(*SM4CBCMode); ok {
-			payload, err = cbc.Encrypt(typ, data)
-			if err != nil {
-				return err
-			}
-		} else if gcm, ok := c.out.cipher.(*SM4GCMMode); ok {
+		if gcm, ok := c.out.cipher.(*SM4GCMMode); ok {
 			payload, err = gcm.Encrypt(typ, data)
 			if err != nil {
 				return err
 			}
-			if c.version >= VersionTLS13 {
-				outType = recordTypeApplicationData
-			}
+			outType = recordTypeApplicationData
 		} else {
 			payload = data // 不加密
 		}
 	} else if !c.isClient && c.serverEncrypted && c.out.cipher != nil {
 		// 服务端发送，使用服务端加密
-		if cbc, ok := c.out.cipher.(*SM4CBCMode); ok {
-			payload, err = cbc.Encrypt(typ, data)
-			if err != nil {
-				return err
-			}
-		} else if gcm, ok := c.out.cipher.(*SM4GCMMode); ok {
+		if gcm, ok := c.out.cipher.(*SM4GCMMode); ok {
 			payload, err = gcm.Encrypt(typ, data)
 			if err != nil {
 				return err
 			}
-			if c.version >= VersionTLS13 {
-				outType = recordTypeApplicationData
-			}
+			outType = recordTypeApplicationData
 		} else {
 			payload = data // 不加密
 		}
@@ -1426,18 +626,9 @@ func (c *Conn) readRecord() (*Record, error) {
 	vers := binary.BigEndian.Uint16(header[1:3])
 	length := binary.BigEndian.Uint16(header[3:5])
 
-	// Debug: log record header
-	debugf("DEBUG readRecord: type=%d (%s), version=0x%04x, length=%d\n",
-		typ, recordTypeToString(typ), vers, length)
-
 	data := make([]byte, length)
 	if _, err := io.ReadFull(c.conn, data); err != nil {
 		return nil, err
-	}
-
-	// Debug: log first 50 bytes for handshake/alert records
-	if typ == recordTypeHandshake || typ == recordTypeAlert {
-		debugf("DEBUG readRecord: data (first 50 bytes): %02x\n", data[:min(50, len(data))])
 	}
 
 	payload := data
@@ -1449,17 +640,7 @@ func (c *Conn) readRecord() (*Record, error) {
 	if shouldDecrypt {
 		if c.isClient && c.serverEncrypted && c.in.cipher != nil {
 			// 客户端接收，使用服务端密钥解密
-			if cbc, ok := c.in.cipher.(*SM4CBCMode); ok {
-				decrypted, err := cbc.Decrypt(typ, data)
-				if err != nil {
-					return nil, err
-				}
-				payload = decrypted
-			} else if gcm, ok := c.in.cipher.(*SM4GCMMode); ok {
-				// DEBUG: 显示原始加密数据
-				if typ == 23 { // ApplicationData (encrypted)
-					debugf("DEBUG readRecord: encrypted payload (hex): %02x\n", data)
-				}
+			if gcm, ok := c.in.cipher.(*SM4GCMMode); ok {
 				decrypted, err := gcm.Decrypt(typ, data)
 				if err != nil {
 					return nil, err
@@ -1468,13 +649,7 @@ func (c *Conn) readRecord() (*Record, error) {
 			}
 		} else if !c.isClient && c.clientEncrypted && c.in.cipher != nil {
 			// 服务端接收，使用客户端密钥解密
-			if cbc, ok := c.in.cipher.(*SM4CBCMode); ok {
-				decrypted, err := cbc.Decrypt(typ, data)
-				if err != nil {
-					return nil, err
-				}
-				payload = decrypted
-			} else if gcm, ok := c.in.cipher.(*SM4GCMMode); ok {
+			if gcm, ok := c.in.cipher.(*SM4GCMMode); ok {
 				decrypted, err := gcm.Decrypt(typ, data)
 				if err != nil {
 					return nil, err
@@ -1484,20 +659,9 @@ func (c *Conn) readRecord() (*Record, error) {
 		}
 	}
 
-	if c.version < VersionTLS13 && typ == recordTypeHandshake && len(payload) > 0 && payload[0] != typeFinished {
-		// TLS 1.2: accumulate handshake transcript (exclude Finished itself)
-		c.handshakeBuf = append(c.handshakeBuf, payload...)
-	}
-
 	// TLS 1.3: after handshake, strip inner content type for callers.
 	if c.version >= VersionTLS13 && typ == recordTypeApplicationData && c.handshakeComplete {
 		if stripped, innerType, err := stripTLS13InnerContentType(payload); err == nil {
-			if debugEnabled {
-				debugf("DEBUG TLS13 innerType=%d (%s), innerLen=%d\n", innerType, recordTypeToString(innerType), len(stripped))
-				if innerType == recordTypeAlert && len(stripped) >= 2 {
-					debugf("DEBUG TLS13 alert: level=%d desc=%d\n", stripped[0], stripped[1])
-				}
-			}
 			if innerType == recordTypeAlert {
 				return &Record{
 					Type:    recordTypeAlert,
@@ -1520,37 +684,6 @@ func (c *Conn) readRecord() (*Record, error) {
 	}, nil
 }
 
-// ============= 握手哈希 =============
-
-// finishedHash 计算 Finished 消息的 verify_data
-//
-// verify_data = PRF(master_secret, finished_label, Hash(handshake_messages))[0..verify_data_length-1]
-//
-// 对于 TLS 1.2:
-//   - finished_label: "client finished" 或 "server finished"
-//   - Hash: SM3
-//   - verify_data_length: 12
-func (c *Conn) finishedHash(isClient bool) []byte {
-	// 确定标签
-	label := []byte("client finished")
-	if !isClient {
-		label = []byte("server finished")
-	}
-
-	// 计算握手消息哈希（包含 Finished 之前的所有握手消息）
-	var handshakeHash []byte
-	if len(c.handshakeBuf) > 0 {
-		hash := SM3(c.handshakeBuf)
-		handshakeHash = hash[:]
-	} else {
-		// 如果没有握手消息缓存，使用零哈希（仅用于向后兼容）
-		handshakeHash = make([]byte, SM3Size)
-	}
-
-	// 计算 verify_data
-	return PRF(c.masterSecret, label, handshakeHash, 12)
-}
-
 // ============= 应用数据读写 =============
 
 func (c *Conn) Read(b []byte) (n int, err error) {
@@ -1571,15 +704,7 @@ func (c *Conn) Read(b []byte) (n int, err error) {
 		}
 
 		if rec.Type == recordTypeAlert {
-			if len(rec.Data) >= 2 {
-				level := rec.Data[0]
-				desc := rec.Data[1]
-				if level == 1 && desc == 0 {
-					return 0, io.EOF
-				}
-				return 0, fmt.Errorf("gmtls: alert level=%d desc=%d", level, desc)
-			}
-			return 0, errors.New("gmtls: invalid alert")
+			return 0, alertErrorWithCloseNotify(rec.Data)
 		}
 		if rec.Type != recordTypeApplicationData {
 			return 0, errors.New("gmtls: expected application data")
@@ -1587,35 +712,14 @@ func (c *Conn) Read(b []byte) (n int, err error) {
 
 		payload := rec.Data
 		if c.version >= VersionTLS13 {
-			if len(rec.Data) > 0 && !isTLS13InnerTypeByte(rec.Data[len(rec.Data)-1]) {
-				payload = rec.Data
-			} else {
-				stripped, innerType, err := stripTLS13InnerContentType(rec.Data)
-				if err != nil {
-					return 0, err
-				}
-				switch innerType {
-				case recordTypeApplicationData:
-					payload = stripped
-				case recordTypeAlert:
-					if len(stripped) >= 2 {
-						level := stripped[0]
-						desc := stripped[1]
-						if level == 1 && desc == 0 { // close_notify
-							return 0, io.EOF
-						}
-						return 0, fmt.Errorf("gmtls: alert level=%d desc=%d", level, desc)
-					}
-					return 0, errors.New("gmtls: invalid alert")
-				case recordTypeHandshake:
-					if c.handshakeComplete && tls13ConsumeNewSessionTickets(stripped, c) {
-						continue
-					}
-					return 0, fmt.Errorf("gmtls: unexpected inner content type %d", innerType)
-				default:
-					return 0, fmt.Errorf("gmtls: unexpected inner content type %d", innerType)
-				}
+			unwrapped, consumed, err := c.unwrapTLS13ApplicationData(rec.Data)
+			if err != nil {
+				return 0, err
 			}
+			if consumed {
+				continue
+			}
+			payload = unwrapped
 		}
 
 		if len(payload) > len(b) {
@@ -1632,19 +736,14 @@ func (c *Conn) Read(b []byte) (n int, err error) {
 
 func tls13AllNewSessionTickets(data []byte) bool {
 	for len(data) > 0 {
-		if len(data) < 4 {
-			return false
-		}
-		typ := data[0]
-		ln := int(data[1])<<16 | int(data[2])<<8 | int(data[3])
-		data = data[4:]
-		if ln < 0 || len(data) < ln {
+		typ, _, rest, err := parseHandshakeMessage(data)
+		if err != nil {
 			return false
 		}
 		if typ != typeNewSessionTicket {
 			return false
 		}
-		data = data[ln:]
+		data = rest
 	}
 	return true
 }
@@ -1654,14 +753,8 @@ func tls13ConsumeNewSessionTickets(data []byte, c *Conn) bool {
 		return false
 	}
 	if err := tls13ParseAndStoreTickets(data, c); err != nil {
-		if debugEnabled {
-			debugf("DEBUG TLS13: failed to parse NewSessionTicket: %v (ignored)\n", err)
-		}
 		// best-effort: ignore tickets even if parsing fails
 		return true
-	}
-	if debugEnabled {
-		debugln("DEBUG TLS13: consumed post-handshake NewSessionTicket(s)")
 	}
 	return true
 }
@@ -1681,17 +774,11 @@ type TLS13SessionTicket struct {
 
 func tls13ParseAndStoreTickets(data []byte, c *Conn) error {
 	for len(data) > 0 {
-		if len(data) < 4 {
-			return errors.New("short handshake header")
+		typ, body, rest, err := parseHandshakeMessage(data)
+		if err != nil {
+			return err
 		}
-		typ := data[0]
-		ln := int(data[1])<<16 | int(data[2])<<8 | int(data[3])
-		data = data[4:]
-		if ln < 0 || len(data) < ln {
-			return errors.New("truncated handshake body")
-		}
-		body := data[:ln]
-		data = data[ln:]
+		data = rest
 		if typ != typeNewSessionTicket {
 			return fmt.Errorf("unexpected post-handshake type %d", typ)
 		}
@@ -1811,73 +898,51 @@ func (c *Conn) SessionTickets() []TLS13SessionTicket {
 // ============= TLS 1.3 客户端握手 =============
 
 func (c *Conn) clientHandshakeTLS13() error {
-	debugln("DEBUG: Starting TLS 1.3 client handshake")
 	// 初始化 transcript hash
 	c.transcriptHash = NewSM3()
 
 	// 发送 ClientHello
-	debugln("DEBUG: Sending ClientHello...")
 	if err := c.sendClientHelloTLS13(); err != nil {
-		debugf("DEBUG: sendClientHelloTLS13 failed: %v\n", err)
 		return err
 	}
-	debugln("DEBUG: ClientHello sent successfully")
 
 	// 接收 ServerHello (可能是 HelloRetryRequest)
-	debugln("DEBUG: Reading ServerHello...")
 	if err := c.readServerHelloTLS13(); err != nil {
 		if errors.Is(err, errHelloRetryRequest) && c.tls13HelloRetry {
-			debugln("DEBUG: HelloRetryRequest received, sending second ClientHello...")
 			// TLS 1.3 middlebox compatibility: send dummy ChangeCipherSpec
 			if err := c.writeRecord(recordTypeChangeCipherSpec, []byte{1}); err != nil {
 				return err
 			}
 			if err := c.sendClientHelloTLS13WithGroup(c.tls13RequestedGroup); err != nil {
-				debugf("DEBUG: sendClientHelloTLS13WithGroup failed: %v\n", err)
 				return err
 			}
 			if err := c.readServerHelloTLS13(); err != nil {
-				debugf("DEBUG: readServerHelloTLS13 failed after HRR: %v\n", err)
 				return err
 			}
 		} else {
-			debugf("DEBUG: readServerHelloTLS13 failed: %v\n", err)
 			return err
 		}
 	}
-	debugln("DEBUG: ServerHello received successfully")
 
 	// 接收 EncryptedExtensions
-	debugln("DEBUG: Reading EncryptedExtensions...")
 	if err := c.readEncryptedExtensions(); err != nil {
-		debugf("DEBUG: readEncryptedExtensions failed: %v\n", err)
 		return err
 	}
-	debugln("DEBUG: EncryptedExtensions received successfully")
 
 	// 接收 Certificate
-	debugln("DEBUG: Reading Certificate...")
 	if err := c.readCertificateTLS13(); err != nil {
-		debugf("DEBUG: readCertificateTLS13 failed: %v\n", err)
 		return err
 	}
-	debugln("DEBUG: Certificate received successfully")
 
 	// 接收 CertificateVerify
-	debugln("DEBUG: Reading CertificateVerify...")
 	if err := c.readCertificateVerifyTLS13(); err != nil {
-		debugf("DEBUG: readCertificateVerifyTLS13 failed: %v\n", err)
 		return err
 	}
-	debugln("DEBUG: CertificateVerify received successfully")
 
 	// 接收 Finished
-	debugln("DEBUG: Reading Finished...")
 	if err := c.readFinishedTLS13(); err != nil {
-		debugf("DEBUG: readFinishedTLS13 failed: %v\n", err)
 		return err
 	}
-	debugln("DEBUG: Finished received successfully")
 
 	// 服务器在其 Finished 后可以立即发送应用数据，客户端需提前切换入站密钥
 	if c.isClient {
@@ -1892,7 +957,7 @@ func (c *Conn) clientHandshakeTLS13() error {
 		}
 		// TLS 1.3: client Certificate/CertificateVerify are encrypted with client handshake keys
 		if !c.clientEncrypted {
-			gcm, err := NewSM4GCMMode(c.tls13KeyMaterial.ClientHandshakeKey, c.tls13KeyMaterial.ClientHandshakeIV, false, true)
+			gcm, err := NewSM4GCMMode(c.tls13KeyMaterial.ClientHandshakeKey, c.tls13KeyMaterial.ClientHandshakeIV)
 			if err != nil {
 				return err
 			}
@@ -1908,12 +973,9 @@ func (c *Conn) clientHandshakeTLS13() error {
 	}
 
 	// 发送 Finished
-	debugln("DEBUG: Sending Finished...")
 	if err := c.sendFinishedTLS13(); err != nil {
-		debugf("DEBUG: sendFinishedTLS13 failed: %v\n", err)
 		return err
 	}
-	debugln("DEBUG: Finished sent successfully")
 
 	// 派生应用流量密钥（包含客户端 Finished）
 	c.deriveTLS13ApplicationKeys()
@@ -1922,7 +984,6 @@ func (c *Conn) clientHandshakeTLS13() error {
 	c.setupApplicationTrafficKeys()
 
 	c.handshakeComplete = true
-	debugln("DEBUG: TLS 1.3 handshake completed successfully")
 	return nil
 }
 
@@ -2071,7 +1132,6 @@ func (c *Conn) sendClientHelloTLS13WithGroup(keyShareGroup uint16) error {
 		data = hello.marshal()
 	}
 
-	debugf("DEBUG ClientHello: %02x\n", data)
 	c.lastClientHello = append([]byte(nil), data...)
 
 	// 更新 transcript hash
@@ -2081,9 +1141,6 @@ func (c *Conn) sendClientHelloTLS13WithGroup(keyShareGroup uint16) error {
 	h := NewSM3()
 	h.Write(data)
 	c.clientHelloHash = h.Sum(nil)
-
-	debugHash := c.transcriptHash.Sum(nil)
-	debugf("DEBUG Transcript hash after ClientHello: %02x\n", debugHash)
 
 	var recordVers uint16 = VersionTLS12
 	if c.tls13ClientHelloCnt == 0 {
@@ -2267,26 +1324,12 @@ func (c *Conn) readServerHelloTLS13() error {
 	}
 
 	if rec.Type != recordTypeHandshake {
-		debugf("DEBUG readServerHelloTLS13: Expected handshake record, got type=%d (%s), version=0x%04x, length=%d\n",
-			rec.Type, recordTypeToString(rec.Type), rec.Version, rec.Length)
-		if rec.Type == 21 && len(rec.Data) >= 2 {
-			// Alert
-			debugf("DEBUG: Alert level=%d, description=%d\n", rec.Data[0], rec.Data[1])
-		}
-		debugf("DEBUG: Data (first 50 bytes): %02x\n", rec.Data[:min(50, len(rec.Data))])
 		return errors.New("gmtls: expected handshake record")
 	}
 
 	// 更新 transcript hash
 	c.transcriptHash.Write(rec.Data)
 	c.lastServerHello = append([]byte(nil), rec.Data...)
-
-	// DEBUG: 输出完整的 ServerHello 数据
-	debugf("DEBUG ServerHello data (%d bytes): %02x\n", len(rec.Data), rec.Data)
-
-	// DEBUG: 输出更新后的 transcript hash
-	serverHelloHashDebug := c.transcriptHash.Sum(nil)
-	debugf("DEBUG Transcript hash after ServerHello: %02x\n", serverHelloHashDebug)
 
 	// 解析 ServerHello
 	hello := new(serverHelloMsg)
@@ -2319,8 +1362,6 @@ func (c *Conn) readServerHelloTLS13() error {
 			}
 			serverKeyShare = keyShare
 			c.tls13KeyMaterial.ServerPublicShare = serverKeyShare.KeyExchange
-			// DEBUG: 输出服务器 key_share
-			debugf("DEBUG Server key_share: group=0x%04x, key_len=%d\n", serverKeyShare.Group, len(serverKeyShare.KeyExchange))
 			break
 		}
 	}
@@ -2328,9 +1369,6 @@ func (c *Conn) readServerHelloTLS13() error {
 	if serverKeyShare == nil {
 		return errors.New("gmtls: server did not send key_share extension")
 	}
-
-	// DEBUG: 输出服务器 key_share
-	debugf("DEBUG Server key_share: group=0x%04x, key_len=%d\n", serverKeyShare.Group, len(serverKeyShare.KeyExchange))
 
 	// 根据服务器选择的组使用对应的私钥
 	var sharedSecret []byte
@@ -2341,7 +1379,6 @@ func (c *Conn) readServerHelloTLS13() error {
 		if err != nil {
 			return fmt.Errorf("gmtls: failed to derive X25519 shared secret: %v", err)
 		}
-		debugf("DEBUG Using X25519 key exchange\n")
 	} else if serverKeyShare.Group == CurveSM2 {
 		// 服务器选择了 SM2
 		serverPubKey, err := ParseSM2PublicKey(serverKeyShare.KeyExchange)
@@ -2359,14 +1396,9 @@ func (c *Conn) readServerHelloTLS13() error {
 		// This is then used directly in TLS 1.3 key derivation (HKDF).
 		sharedSecret = ecdhSecret
 
-		debugf("DEBUG Using SM2 ECDH key exchange (secret_len=%d)\n", len(sharedSecret))
-		debugf("DEBUG Shared secret: %02x\n", sharedSecret)
 	} else {
 		return fmt.Errorf("gmtls: server selected unsupported group 0x%04x", serverKeyShare.Group)
 	}
-
-	// DEBUG: 输出共享密钥
-	debugf("DEBUG Shared secret: %02x\n", sharedSecret)
 
 	// 保存共享密钥供后续密钥派生使用
 	c.tls13KeyMaterial.SharedSecret = sharedSecret
@@ -2374,21 +1406,14 @@ func (c *Conn) readServerHelloTLS13() error {
 	// 派生 TLS 1.3 密钥
 	c.deriveTLS13Keys()
 
-	// DEBUG: 输出 transcript hash
-	clientHelloHash := c.clientHelloHash
-	serverHelloHash := c.transcriptHash.Sum(nil)
-	debugf("DEBUG ClientHello hash: %02x\n", clientHelloHash)
-	debugf("DEBUG ServerHello hash (transcript): %02x\n", serverHelloHash)
-
 	// 启用服务端握手流量解密
 	// 从现在开始，服务端发送的所有记录都使用 ServerHandshakeTrafficSecret 加密
 	c.serverEncrypted = true
-	gcm, err := NewSM4GCMMode(c.tls13KeyMaterial.ServerHandshakeKey, c.tls13KeyMaterial.ServerHandshakeIV, false, true)
+	gcm, err := NewSM4GCMMode(c.tls13KeyMaterial.ServerHandshakeKey, c.tls13KeyMaterial.ServerHandshakeIV)
 	if err != nil {
 		return fmt.Errorf("gmtls: failed to create server cipher: %v", err)
 	}
 	c.in.cipher = gcm
-	debugln("DEBUG: Enabled server handshake traffic decryption")
 
 	return nil
 }
@@ -2405,7 +1430,6 @@ func (c *Conn) readEncryptedExtensions() error {
 		return fmt.Errorf("gmtls: failed to unmarshal EncryptedExtensions: %v", err)
 	}
 
-	debugln("DEBUG: Successfully parsed EncryptedExtensions")
 	for _, ext := range msg.Extensions {
 		if ext.Type == extensionALPN {
 			protocols, err := parseALPNExtension(ext.Data)
@@ -2451,7 +1475,6 @@ func (c *Conn) readCertificateTLS13() error {
 			}
 			c.peerCert = cert
 
-			debugln("DEBUG: Successfully parsed Certificate")
 			c.transcriptHash.Write(msgBytes)
 			return nil
 		default:
@@ -2472,29 +1495,13 @@ func (c *Conn) readCertificateVerifyTLS13() error {
 	if err := msg.unmarshal(msgBytes); err != nil {
 		return err
 	}
-	debugf("DEBUG: CertificateVerify algorithm=0x%04x, sig_len=%d\n", msg.Algorithm, len(msg.Signature))
 
 	// 验证签名
 	transcriptHash := c.transcriptHash.Sum(nil)
-	if debugEnabled {
-		debugf("DEBUG: CertificateVerify transcript hash=%02x\n", transcriptHash)
-		debugf("DEBUG: CertificateVerify SM2 cert ID=%q\n", sm2TLS13CertVerifyID())
-	}
 
-	var sig *Signature
-	if len(msg.Signature) == 64 {
-		r := new(big.Int).SetBytes(msg.Signature[:32])
-		s := new(big.Int).SetBytes(msg.Signature[32:])
-		sig = &Signature{R: r, S: s}
-	} else {
-		var derSig struct {
-			R *big.Int
-			S *big.Int
-		}
-		if _, err := asn1.Unmarshal(msg.Signature, &derSig); err != nil || derSig.R == nil || derSig.S == nil {
-			return errors.New("gmtls: invalid signature length for SM2")
-		}
-		sig = &Signature{R: derSig.R, S: derSig.S}
+	sig, err := parseSM2Signature(msg.Signature)
+	if err != nil {
+		return err
 	}
 
 	if c.config != nil && c.config.InsecureSkipVerify {
@@ -2504,12 +1511,8 @@ func (c *Conn) readCertificateVerifyTLS13() error {
 		if c.peerCert == nil || c.peerCert.PublicKey == nil {
 			return errors.New("gmtls: no peer certificate for signature verification")
 		}
-		context := []byte("TLS 1.3, server CertificateVerify")
-		signed := make([]byte, 0, 64+len(context)+1+len(transcriptHash))
-		signed = append(signed, bytes.Repeat([]byte{0x20}, 64)...)
-		signed = append(signed, context...)
-		signed = append(signed, 0x00)
-		signed = append(signed, transcriptHash...)
+		context := "TLS 1.3, server CertificateVerify"
+		signed := tls13CertVerifySigned(context, transcriptHash)
 
 		verifyWithPub := func(pub *PublicKey) (bool, error) {
 			ok, err := sm2TLS13VerifyWithID(pub, signed, msg.Signature, sm2TLS13CertVerifyID())
@@ -2596,7 +1599,6 @@ func (c *Conn) readCertificateVerifyTLS13() error {
 		}
 	}
 
-	debugln("DEBUG: Successfully verified CertificateVerify")
 	c.transcriptHash.Write(msgBytes)
 	return nil
 }
@@ -2636,8 +1638,6 @@ func (c *Conn) readFinishedTLS13() error {
 		}
 	}
 
-	debugln("DEBUG: Successfully verified Finished")
-
 	// 更新 transcript hash
 	c.transcriptHash.Write(msgBytes)
 	// Save transcript hash after including server Finished (for app key derivation variants)
@@ -2649,7 +1649,7 @@ func (c *Conn) readFinishedTLS13() error {
 	if c.isClient {
 		// 客户端接收服务端的Finished后，启用服务端的加密
 		c.serverEncrypted = true
-		gcm, err := NewSM4GCMMode(c.tls13KeyMaterial.ServerHandshakeKey, c.tls13KeyMaterial.ServerHandshakeIV, false, true)
+		gcm, err := NewSM4GCMMode(c.tls13KeyMaterial.ServerHandshakeKey, c.tls13KeyMaterial.ServerHandshakeIV)
 		if err != nil {
 			return err
 		}
@@ -2657,7 +1657,7 @@ func (c *Conn) readFinishedTLS13() error {
 	} else {
 		// 服务端接收客户端的Finished后，启用客户端的加密
 		c.clientEncrypted = true
-		gcm, err := NewSM4GCMMode(c.tls13KeyMaterial.ClientHandshakeKey, c.tls13KeyMaterial.ClientHandshakeIV, false, true)
+		gcm, err := NewSM4GCMMode(c.tls13KeyMaterial.ClientHandshakeKey, c.tls13KeyMaterial.ClientHandshakeIV)
 		if err != nil {
 			return err
 		}
@@ -2677,10 +1677,6 @@ func (c *Conn) sendFinishedTLS13() error {
 	}
 	finishedKey := DeriveFinishedKey(verifyKey)
 	verifyData := VerifyDataTLS13(finishedKey, transcriptHash)
-	if debugEnabled {
-		debugf("DEBUG: Client Finished transcript hash=%02x\n", transcriptHash)
-		debugf("DEBUG: Client Finished verify_data=%02x\n", verifyData)
-	}
 
 	msg := &finishedMsg{
 		VerifyData: verifyData,
@@ -2696,7 +1692,7 @@ func (c *Conn) sendFinishedTLS13() error {
 
 	// 启用客户端加密（若已启用则不要重置序列号）
 	if !c.clientEncrypted || c.out.cipher == nil {
-		gcm, err := NewSM4GCMMode(c.tls13KeyMaterial.ClientHandshakeKey, c.tls13KeyMaterial.ClientHandshakeIV, false, true)
+		gcm, err := NewSM4GCMMode(c.tls13KeyMaterial.ClientHandshakeKey, c.tls13KeyMaterial.ClientHandshakeIV)
 		if err != nil {
 			return err
 		}
@@ -2705,6 +1701,18 @@ func (c *Conn) sendFinishedTLS13() error {
 	}
 
 	return c.writeRecord(recordTypeHandshake, data)
+}
+
+func (c *Conn) newTLS13GCM(key, iv []byte) (*SM4GCMMode, error) {
+	gcm, err := NewSM4GCMMode(key, iv)
+	if err != nil {
+		return nil, err
+	}
+	if c.version >= VersionTLS13 {
+		gcm.readSeq = 0
+		gcm.writeSeq = 0
+	}
+	return gcm, nil
 }
 
 // setupApplicationTrafficKeys 设置应用流量密钥
@@ -2721,25 +1729,17 @@ func (c *Conn) setupApplicationTrafficKeys() {
 		outKey := c.tls13KeyMaterial.ClientAppKey
 		outIV := c.tls13KeyMaterial.ClientAppIV
 
-		gcmServer, err := NewSM4GCMMode(inKey, inIV, false, true)
+		gcmServer, err := c.newTLS13GCM(inKey, inIV)
 		if err != nil {
 			return
 		}
 		c.in.cipher = gcmServer
-		if c.version >= VersionTLS13 {
-			gcmServer.readSeq = 0
-			gcmServer.writeSeq = 0
-		}
 
-		gcmClient, err := NewSM4GCMMode(outKey, outIV, false, true)
+		gcmClient, err := c.newTLS13GCM(outKey, outIV)
 		if err != nil {
 			return
 		}
 		c.out.cipher = gcmClient
-		if c.version >= VersionTLS13 {
-			gcmClient.readSeq = 0
-			gcmClient.writeSeq = 0
-		}
 	} else {
 		// 服务端：入站用客户端密钥，出站用服务端密钥
 		inKey := c.tls13KeyMaterial.ClientAppKey
@@ -2747,25 +1747,17 @@ func (c *Conn) setupApplicationTrafficKeys() {
 		outKey := c.tls13KeyMaterial.ServerAppKey
 		outIV := c.tls13KeyMaterial.ServerAppIV
 
-		gcmClient, err := NewSM4GCMMode(inKey, inIV, false, true)
+		gcmClient, err := c.newTLS13GCM(inKey, inIV)
 		if err != nil {
 			return
 		}
 		c.in.cipher = gcmClient
-		if c.version >= VersionTLS13 {
-			gcmClient.readSeq = 0
-			gcmClient.writeSeq = 0
-		}
 
-		gcmServer, err := NewSM4GCMMode(outKey, outIV, false, true)
+		gcmServer, err := c.newTLS13GCM(outKey, outIV)
 		if err != nil {
 			return
 		}
 		c.out.cipher = gcmServer
-		if c.version >= VersionTLS13 {
-			gcmServer.readSeq = 0
-			gcmServer.writeSeq = 0
-		}
 	}
 }
 
@@ -2778,15 +1770,17 @@ func (c *Conn) setupServerApplicationTrafficKeysForClient() {
 	if len(c.tls13KeyMaterial.ServerAppKey) == 0 || len(c.tls13KeyMaterial.ServerAppIV) == 0 {
 		return
 	}
-	gcmServer, err := NewSM4GCMMode(c.tls13KeyMaterial.ServerAppKey, c.tls13KeyMaterial.ServerAppIV, false, true)
+	gcmServer, err := c.newTLS13GCM(c.tls13KeyMaterial.ServerAppKey, c.tls13KeyMaterial.ServerAppIV)
 	if err != nil {
 		return
 	}
 	c.in.cipher = gcmServer
-	if c.version >= VersionTLS13 {
-		gcmServer.readSeq = 0
-		gcmServer.writeSeq = 0
-	}
+}
+
+func (c *Conn) deriveTLS13AppKeys(baseSecret, label, transcriptHash []byte) (secret, key, iv []byte) {
+	secret = DeriveSecret(baseSecret, label, transcriptHash)
+	key, iv = DeriveTrafficKeys(secret, []byte("key"), c.cipherSuite.KeyLen, c.cipherSuite.IVLen)
+	return secret, key, iv
 }
 
 // deriveTLS13ApplicationKeys 在握手完成后派生应用流量密钥
@@ -2807,21 +1801,10 @@ func (c *Conn) deriveTLS13ApplicationKeys() {
 	}
 	clientFinishedHash := serverFinishedHash
 	baseSecret := c.tls13KeyMaterial.MasterSecret
-	c.tls13KeyMaterial.ClientAppTrafficSecret = DeriveSecret(baseSecret, tls13LabelClientTraffic, clientFinishedHash)
-	c.tls13KeyMaterial.ServerAppTrafficSecret = DeriveSecret(baseSecret, tls13LabelServerTraffic, serverFinishedHash)
-
-	c.tls13KeyMaterial.ClientAppKey, c.tls13KeyMaterial.ClientAppIV = DeriveTrafficKeys(
-		c.tls13KeyMaterial.ClientAppTrafficSecret,
-		[]byte("key"),
-		c.cipherSuite.KeyLen,
-		c.cipherSuite.IVLen,
-	)
-	c.tls13KeyMaterial.ServerAppKey, c.tls13KeyMaterial.ServerAppIV = DeriveTrafficKeys(
-		c.tls13KeyMaterial.ServerAppTrafficSecret,
-		[]byte("key"),
-		c.cipherSuite.KeyLen,
-		c.cipherSuite.IVLen,
-	)
+	c.tls13KeyMaterial.ClientAppTrafficSecret, c.tls13KeyMaterial.ClientAppKey, c.tls13KeyMaterial.ClientAppIV =
+		c.deriveTLS13AppKeys(baseSecret, tls13LabelClientTraffic, clientFinishedHash)
+	c.tls13KeyMaterial.ServerAppTrafficSecret, c.tls13KeyMaterial.ServerAppKey, c.tls13KeyMaterial.ServerAppIV =
+		c.deriveTLS13AppKeys(baseSecret, tls13LabelServerTraffic, serverFinishedHash)
 
 }
 
@@ -2838,14 +1821,8 @@ func (c *Conn) deriveTLS13ServerAppKeys() {
 		serverFinishedHash = c.tls13ServerFinishedHash
 	}
 	baseSecret := c.tls13KeyMaterial.MasterSecret
-	c.tls13KeyMaterial.ServerAppTrafficSecret = DeriveSecret(baseSecret, tls13LabelServerTraffic, serverFinishedHash)
-
-	c.tls13KeyMaterial.ServerAppKey, c.tls13KeyMaterial.ServerAppIV = DeriveTrafficKeys(
-		c.tls13KeyMaterial.ServerAppTrafficSecret,
-		[]byte("key"),
-		c.cipherSuite.KeyLen,
-		c.cipherSuite.IVLen,
-	)
+	c.tls13KeyMaterial.ServerAppTrafficSecret, c.tls13KeyMaterial.ServerAppKey, c.tls13KeyMaterial.ServerAppIV =
+		c.deriveTLS13AppKeys(baseSecret, tls13LabelServerTraffic, serverFinishedHash)
 }
 
 // deriveTLS13Keys 派生 TLS 1.3 密钥
@@ -3159,10 +2136,6 @@ func (c *Conn) sendCertificateTLS13() error {
 	if c.localCert == nil {
 		return errors.New("gmtls: missing client certificate")
 	}
-	if debugEnabled {
-		chainLen := len(c.localCert.Chain)
-		debugf("DEBUG: Sending client Certificate (chain entries=%d, raw_len=%d)\n", chainLen, len(c.localCert.Raw))
-	}
 	data := marshalCertificateTLS13(c.localCert, c.tls13CertReqContext)
 
 	// 更新 transcript hash
@@ -3178,17 +2151,8 @@ func (c *Conn) sendCertificateVerifyTLS13() error {
 	transcriptHash := c.transcriptHash.Sum(nil)
 
 	// 计算待签名的数据（TLS 1.3 格式）
-	context := []byte("TLS 1.3, client CertificateVerify")
-	signed := make([]byte, 0, 64+len(context)+1+len(transcriptHash))
-	signed = append(signed, bytes.Repeat([]byte{0x20}, 64)...)
-	signed = append(signed, context...)
-	signed = append(signed, 0x00)
-	signed = append(signed, transcriptHash...)
-	if debugEnabled {
-		debugf("DEBUG: Client CertificateVerify transcript hash=%02x\n", transcriptHash)
-		debugf("DEBUG: Client CertificateVerify signed (len=%d)=%02x\n", len(signed), signed)
-		debugf("DEBUG: Client CertificateVerify SM2 cert ID=%q\n", sm2TLS13HandshakeID())
-	}
+	context := "TLS 1.3, client CertificateVerify"
+	signed := tls13CertVerifySigned(context, transcriptHash)
 
 	// 使用本地私钥对原始消息签名
 	var signatureBytes []byte
@@ -3203,9 +2167,6 @@ func (c *Conn) sendCertificateVerifyTLS13() error {
 	msg := &certificateVerifyMsg{
 		Algorithm: SM2SM3, // SM2 with SM3 签名算法 (TLS 1.3)
 		Signature: signatureBytes,
-	}
-	if debugEnabled {
-		debugf("DEBUG: Client CertificateVerify signature (len=%d)=%02x\n", len(signatureBytes), signatureBytes)
 	}
 
 	// 序列化

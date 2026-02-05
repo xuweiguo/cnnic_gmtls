@@ -56,6 +56,19 @@ type Signature struct {
 	R, S *big.Int
 }
 
+func parseSM2Signature(derOrRaw []byte) (*Signature, error) {
+	if len(derOrRaw) == 64 {
+		r := new(big.Int).SetBytes(derOrRaw[:32])
+		s := new(big.Int).SetBytes(derOrRaw[32:])
+		return &Signature{R: r, S: s}, nil
+	}
+	return signatureFromASN1(derOrRaw)
+}
+
+func validSignatureInput(pub *PublicKey, sig *Signature) bool {
+	return pub != nil && sig != nil && sig.R != nil && sig.S != nil
+}
+
 // GenerateKey 生成 SM2 密钥对。
 func GenerateKey() (*PrivateKey, *PublicKey, error) {
 	return GenerateKeyWithReader(rand.Reader)
@@ -117,7 +130,7 @@ func SignMessage(priv *PrivateKey, msg []byte) (*Signature, error) {
 //
 // 注意：此函数会按 GM 逻辑对输入做 ZA 处理（与旧实现一致）。
 func Verify(pub *PublicKey, hash []byte, sig *Signature) bool {
-	if pub == nil || sig == nil || sig.R == nil || sig.S == nil {
+	if !validSignatureInput(pub, sig) {
 		return false
 	}
 	ecdsaPub := &ecdsa.PublicKey{Curve: SM2Curve, X: pub.X, Y: pub.Y}
@@ -126,7 +139,7 @@ func Verify(pub *PublicKey, hash []byte, sig *Signature) bool {
 
 // VerifyMessage 使用 SM2 公钥验证原始消息签名。
 func VerifyMessage(pub *PublicKey, msg []byte, sig *Signature) bool {
-	if pub == nil || sig == nil || sig.R == nil || sig.S == nil {
+	if !validSignatureInput(pub, sig) {
 		return false
 	}
 	ecdsaPub := &ecdsa.PublicKey{Curve: SM2Curve, X: pub.X, Y: pub.Y}
@@ -135,7 +148,7 @@ func VerifyMessage(pub *PublicKey, msg []byte, sig *Signature) bool {
 
 // VerifyWithUserID 使用指定用户 ID 验证哈希。
 func VerifyWithUserID(pub *PublicKey, hash []byte, sig *Signature, userID []byte) bool {
-	if pub == nil || sig == nil || sig.R == nil || sig.S == nil {
+	if !validSignatureInput(pub, sig) {
 		return false
 	}
 	ecdsaPub := &ecdsa.PublicKey{Curve: SM2Curve, X: pub.X, Y: pub.Y}
@@ -144,7 +157,7 @@ func VerifyWithUserID(pub *PublicKey, hash []byte, sig *Signature, userID []byte
 
 // VerifyMessageWithUserID 使用指定用户 ID 验证原始消息。
 func VerifyMessageWithUserID(pub *PublicKey, msg []byte, sig *Signature, userID []byte) bool {
-	if pub == nil || sig == nil || sig.R == nil || sig.S == nil {
+	if !validSignatureInput(pub, sig) {
 		return false
 	}
 	ecdsaPub := &ecdsa.PublicKey{Curve: SM2Curve, X: pub.X, Y: pub.Y}
@@ -153,7 +166,7 @@ func VerifyMessageWithUserID(pub *PublicKey, msg []byte, sig *Signature, userID 
 
 // VerifyMessageNoZA 验证 SM3(msg) 的签名，不包含 ZA（非标准，供互通使用）。
 func VerifyMessageNoZA(pub *PublicKey, msg []byte, sig *Signature) bool {
-	if pub == nil || sig == nil || sig.R == nil || sig.S == nil {
+	if !validSignatureInput(pub, sig) {
 		return false
 	}
 	hash := SM3(msg)
@@ -183,7 +196,7 @@ func SignMessageNoZA(priv *PrivateKey, msg []byte) (*Signature, error) {
 }
 
 func verifyHashNoZA(pub *PublicKey, hash []byte, sig *Signature) bool {
-	if pub == nil || sig == nil || sig.R == nil || sig.S == nil {
+	if !validSignatureInput(pub, sig) {
 		return false
 	}
 	der, err := signatureToASN1(sig)
