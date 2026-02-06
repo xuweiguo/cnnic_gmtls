@@ -446,7 +446,7 @@ func marshalKeyShareExtension(entries []KeyShareEntry) Extension {
 //	    KeyShareEntry server_share;
 //	} KeyShareServerHello;
 func parseKeyShareExtension(data []byte) (*KeyShareEntry, error) {
-	if len(data) < 3 {
+	if len(data) < 4 {
 		return nil, errors.New("gmtls: invalid key share extension")
 	}
 

@@ -56,6 +56,23 @@ func LoadCertificatesFromPEM(path string) ([][]byte, error) {
 	return parseCertificatesFromPEMBytes(b)
 }
 
+// LoadCertPoolFromPEM loads a PEM file into a new SM2-capable cert pool.
+func LoadCertPoolFromPEM(path string) (*smx509.CertPool, error) {
+	certs, err := LoadCertificatesFromPEM(path)
+	if err != nil {
+		return nil, err
+	}
+	pool := smx509.NewCertPool()
+	for _, der := range certs {
+		cert, err := smx509.ParseCertificate(der)
+		if err != nil {
+			return nil, err
+		}
+		pool.AddCert(cert)
+	}
+	return pool, nil
+}
+
 func parseCertificatesFromPEMBytes(b []byte) ([][]byte, error) {
 	var certs [][]byte
 	for {

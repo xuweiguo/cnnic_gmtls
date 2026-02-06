@@ -2,6 +2,7 @@ package gmtls
 
 import (
 	"net"
+	"sync"
 	"time"
 )
 
@@ -134,6 +135,7 @@ func (c *Config) Clone() *Config {
 		return &Config{}
 	}
 	cc := *c
+	cc.sessionTicketsMu = sync.Mutex{}
 	if c.CipherSuites != nil {
 		cc.CipherSuites = append([]uint16(nil), c.CipherSuites...)
 	}

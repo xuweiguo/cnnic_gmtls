@@ -17,7 +17,7 @@ var (
 	tls13LabelHandshakeSecret = []byte("handshake traffic")
 	tls13LabelClientHandshake = []byte("c hs traffic")
 	tls13LabelServerHandshake = []byte("s hs traffic")
-	tls13LabelMasterSecret    = []byte("c ap traffic")
+	tls13LabelMasterSecret    = []byte("master secret")
 	tls13LabelClientTraffic   = []byte("c ap traffic")
 	tls13LabelServerTraffic   = []byte("s ap traffic")
 	tls13LabelKeyUpdate       = []byte("traffic upd")
@@ -47,12 +47,11 @@ func SM3HKDFExtract(secret, salt []byte) []byte {
 
 // HKDFExpand 扩展密钥
 func SM3HKDFExpand(secret, info []byte, keyLen int) []byte {
-	var result []byte
-
 	// 根据输出长度计算需要的迭代次数
 	// SM3 输出 32 字节
 	h := SM3HashSize
 	n := (keyLen + h - 1) / h
+	result := make([]byte, 0, n*h)
 
 	for i := 1; i <= n; i++ {
 		// T(i) = HMAC(secret, T(i-1) | info | 0x01)
