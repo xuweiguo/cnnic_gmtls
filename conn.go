@@ -1820,14 +1820,25 @@ func (c *Conn) sendFinishedTLS13() error {
 		c.tls13ServerFinishedHash = append([]byte(nil), c.transcriptHash.Sum(nil)...)
 	}
 
-	// 启用客户端加密（若已启用则不要重置序列号）
-	if !c.clientEncrypted || c.out.cipher == nil {
-		gcm, err := NewSM4GCMMode(c.tls13KeyMaterial.ClientHandshakeKey, c.tls13KeyMaterial.ClientHandshakeIV)
-		if err != nil {
-			return err
+	// 发送 Finished 前，按角色启用正确方向的握手流量密钥。
+	if c.isClient {
+		if !c.clientEncrypted || c.out.cipher == nil {
+			gcm, err := NewSM4GCMMode(c.tls13KeyMaterial.ClientHandshakeKey, c.tls13KeyMaterial.ClientHandshakeIV)
+			if err != nil {
+				return err
+			}
+			c.out.cipher = gcm
+			c.clientEncrypted = true
 		}
-		c.out.cipher = gcm
-		c.clientEncrypted = true
+	} else {
+		if !c.serverEncrypted || c.out.cipher == nil {
+			gcm, err := NewSM4GCMMode(c.tls13KeyMaterial.ServerHandshakeKey, c.tls13KeyMaterial.ServerHandshakeIV)
+			if err != nil {
+				return err
+			}
+			c.out.cipher = gcm
+			c.serverEncrypted = true
+		}
 	}
 
 	return c.writeRecord(recordTypeHandshake, data)
@@ -2023,6 +2034,17 @@ func (c *Conn) serverHandshakeTLS13() error {
 	// 发送 Finished
 	if err := c.sendFinishedTLS13(); err != nil {
 		return err
+	}
+
+	// 服务端读取客户端后续握手消息（Certificate/CertificateVerify/Finished）前，
+	// 需启用客户端握手流量密钥进行入站解密。
+	if !c.clientEncrypted || c.in.cipher == nil {
+		gcm, err := NewSM4GCMMode(c.tls13KeyMaterial.ClientHandshakeKey, c.tls13KeyMaterial.ClientHandshakeIV)
+		if err != nil {
+			return err
+		}
+		c.clientEncrypted = true
+		c.in.cipher = gcm
 	}
 
 	if requestClientCert {
@@ -2226,7 +2248,7 @@ func (c *Conn) sendServerHelloTLS13() error {
 			Type: extensionSupportedVersions,
 			Data: []byte{0x03, 0x04}, // TLS 1.3
 		},
-		marshalKeyShareExtension([]KeyShareEntry{serverKeyShare}),
+		marshalKeyShareServerHelloExtension(serverKeyShare),
 	}
 
 	// 构造 ServerHello
@@ -2252,6 +2274,14 @@ func (c *Conn) sendServerHelloTLS13() error {
 
 	// 派生 TLS 1.3 密钥
 	c.deriveTLS13Keys()
+
+	// TLS 1.3: ServerHello 之后，服务端后续握手消息需使用服务端握手流量密钥加密。
+	gcm, err := NewSM4GCMMode(c.tls13KeyMaterial.ServerHandshakeKey, c.tls13KeyMaterial.ServerHandshakeIV)
+	if err != nil {
+		return fmt.Errorf("gmtls: failed to create server handshake cipher: %v", err)
+	}
+	c.serverEncrypted = true
+	c.out.cipher = gcm
 
 	return nil
 }

@@ -20,6 +20,7 @@ coverage.html
 # Dependency directories
 vendor/
 cnnic/
+lib/
 # Go workspace file
 go.work
 

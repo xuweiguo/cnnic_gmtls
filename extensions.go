@@ -396,17 +396,7 @@ type KeyShareEntry struct {
 	KeyExchange []byte // 密钥交换数据 (公钥)
 }
 
-// marshalKeyShareExtension 编码 TLS 1.3 Key Share 扩展
-// Key Share 扩展格式：
-//
-//	struct {
-//	    KeyShareEntry client_shares<0..2^16-1>;
-//	} KeyShareClientHello;
-//
-//	struct {
-//	    NamedGroup group;
-//	    opaque key_exchange<0..2^16-1>;
-//	} KeyShareEntry;
+// marshalKeyShareExtension encodes the ClientHello key_share extension.
 func marshalKeyShareExtension(entries []KeyShareEntry) Extension {
 	if len(entries) == 0 {
 		return Extension{}
@@ -433,6 +423,26 @@ func marshalKeyShareExtension(entries []KeyShareEntry) Extension {
 	data := buf.Bytes()
 	binary.BigEndian.PutUint16(data[lengthOffset:lengthOffset+2], uint16(totalLength))
 
+	return Extension{
+		Type: extensionKeyShare,
+		Data: data,
+	}
+}
+
+// marshalKeyShareServerHelloExtension encodes the ServerHello key_share extension.
+// Format:
+//
+//	struct {
+//	    KeyShareEntry server_share;
+//	} KeyShareServerHello;
+func marshalKeyShareServerHelloExtension(entry KeyShareEntry) Extension {
+	if len(entry.KeyExchange) == 0 {
+		return Extension{}
+	}
+	data := make([]byte, 4+len(entry.KeyExchange))
+	binary.BigEndian.PutUint16(data[0:2], entry.Group)
+	binary.BigEndian.PutUint16(data[2:4], uint16(len(entry.KeyExchange)))
+	copy(data[4:], entry.KeyExchange)
 	return Extension{
 		Type: extensionKeyShare,
 		Data: data,
