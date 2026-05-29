@@ -10,10 +10,7 @@ func TestVerifyPeerCertificateMissing(t *testing.T) {
 }
 
 func TestVerifyServerCertificateNilConfigDoesNotPanic(t *testing.T) {
-	cert, err := LoadCertificateFromPEM("cnnic/gm/xmnw.crt")
-	if err != nil {
-		t.Fatalf("LoadCertificateFromPEM() error = %v", err)
-	}
+	cert, _ := newTestSM2Certificate(t)
 
 	c := &Conn{clientServerName: "example.cn"}
 	defer func() {
@@ -25,10 +22,7 @@ func TestVerifyServerCertificateNilConfigDoesNotPanic(t *testing.T) {
 }
 
 func TestVerifyClientCertificateNilConfigDoesNotPanic(t *testing.T) {
-	cert, err := LoadCertificateFromPEM("cnnic/gm/xmnw.crt")
-	if err != nil {
-		t.Fatalf("LoadCertificateFromPEM() error = %v", err)
-	}
+	cert, _ := newTestSM2Certificate(t)
 
 	c := &Conn{}
 	defer func() {

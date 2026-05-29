@@ -8,14 +8,7 @@ import (
 )
 
 func TestTLS13OfflineHandshakeAndData(t *testing.T) {
-	cert, err := LoadCertificateFromPEM("cnnic/gm/xmnw.crt")
-	if err != nil {
-		t.Fatalf("LoadCertificateFromPEM() error = %v", err)
-	}
-	key, err := LoadSM2PrivateKeyFromPEM("cnnic/gm/xmnw.key", "xmnwxmnw")
-	if err != nil {
-		t.Fatalf("LoadSM2PrivateKeyFromPEM() error = %v", err)
-	}
+	cert, key := newTestSM2Certificate(t)
 
 	srvCfg := &Config{
 		SignCertificates: []*Certificate{cert},
