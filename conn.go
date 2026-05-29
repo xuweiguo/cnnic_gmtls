@@ -10,7 +10,10 @@ import (
 	"hash"
 	"io"
 	"net"
+	"sync"
 	"time"
+
+	"github.com/emmansun/gmsm/smx509"
 )
 
 func min(a, b int) int {
@@ -264,6 +267,7 @@ type Conn struct {
 	tls13RequestedGroup uint16
 	tls13SessionID      []byte
 	tls13ClientHelloCnt int
+	tls13DidResume      bool
 	nextRecordVersion   uint16
 	tls13SM2NoZA        bool
 	tls13HandshakeBuf   []byte
@@ -404,8 +408,11 @@ type Config struct {
 	EncCertificates    []*Certificate
 	EncPrivateKey      *PrivateKey
 	InsecureSkipVerify bool
+	RequireClientCert  bool
 	MinVersion         uint16 // 最低 TLS 版本
 	MaxVersion         uint16 // 最高 TLS 版本
+	RootCAs            *smx509.CertPool
+	ClientCAs          *smx509.CertPool
 
 	// 扩展配置
 	ServerName string   // SNI - 服务端名称指示
@@ -415,6 +422,8 @@ type Config struct {
 	// TLS 1.3 session resumption (client)
 	SessionTickets     []TLS13SessionTicket
 	OnNewSessionTicket func(TLS13SessionTicket)
+	SessionTicketLimit int
+	sessionTicketsMu   sync.Mutex
 }
 
 func normalizeCipherSuiteID(id uint16) uint16 {
@@ -791,11 +800,81 @@ func tls13ParseAndStoreTickets(data []byte, c *Conn) error {
 			t.PSK = DeriveResumptionPSK(c.tls13KeyMaterial.ResumptionMasterSecret, t.Nonce)
 		}
 		c.tls13Tickets = append(c.tls13Tickets, t)
-		if c != nil && c.config != nil && c.config.OnNewSessionTicket != nil {
-			c.config.OnNewSessionTicket(t)
+		if c != nil {
+			c.storeSessionTicket(t)
 		}
 	}
 	return nil
+}
+
+func (c *Conn) storeSessionTicket(t TLS13SessionTicket) {
+	if c == nil || c.config == nil {
+		return
+	}
+	if c.config.OnNewSessionTicket != nil {
+		c.config.OnNewSessionTicket(t)
+	}
+
+	c.config.sessionTicketsMu.Lock()
+	defer c.config.sessionTicketsMu.Unlock()
+
+	limit := c.config.SessionTicketLimit
+	if limit <= 0 {
+		limit = 4
+	}
+
+	// Drop expired tickets.
+	now := time.Now()
+	dst := c.config.SessionTickets[:0]
+	for _, existing := range c.config.SessionTickets {
+		if existing.ReceivedAt.IsZero() || existing.Lifetime == 0 {
+			continue
+		}
+		if now.Sub(existing.ReceivedAt) > time.Duration(existing.Lifetime)*time.Second {
+			continue
+		}
+		dst = append(dst, existing)
+	}
+	c.config.SessionTickets = dst
+
+	// Prepend new ticket and de-duplicate by ticket bytes.
+	var out []TLS13SessionTicket
+	out = append(out, t)
+	for _, existing := range c.config.SessionTickets {
+		if bytes.Equal(existing.Ticket, t.Ticket) {
+			continue
+		}
+		out = append(out, existing)
+		if len(out) >= limit {
+			break
+		}
+	}
+	c.config.SessionTickets = out
+}
+
+func (c *Conn) snapshotSessionTickets() []TLS13SessionTicket {
+	if c == nil || c.config == nil {
+		return nil
+	}
+	c.config.sessionTicketsMu.Lock()
+	defer c.config.sessionTicketsMu.Unlock()
+	if len(c.config.SessionTickets) == 0 {
+		return nil
+	}
+	out := make([]TLS13SessionTicket, len(c.config.SessionTickets))
+	for i, t := range c.config.SessionTickets {
+		out[i] = t
+		if t.Nonce != nil {
+			out[i].Nonce = append([]byte(nil), t.Nonce...)
+		}
+		if t.Ticket != nil {
+			out[i].Ticket = append([]byte(nil), t.Ticket...)
+		}
+		if t.PSK != nil {
+			out[i].PSK = append([]byte(nil), t.PSK...)
+		}
+	}
+	return out
 }
 
 func tls13ParseNewSessionTicket(body []byte) (TLS13SessionTicket, error) {
@@ -935,7 +1014,7 @@ func (c *Conn) clientHandshakeTLS13() error {
 	}
 
 	// 接收 CertificateVerify
-	if err := c.readCertificateVerifyTLS13(); err != nil {
+	if err := c.readCertificateVerifyTLS13("TLS 1.3, server CertificateVerify"); err != nil {
 		return err
 	}
 
@@ -1067,8 +1146,12 @@ func (c *Conn) sendClientHelloTLS13WithGroup(keyShareGroup uint16) error {
 	// 2. ec_point_formats
 	extensions = append(extensions, marshalECPointFormatsExtension())
 
-	// 3. supported_groups
-	supportedGroupsExt := marshalSupportedCurvesExtension([]uint16{CurveSM2})
+	// 3. supported_groups (keep preference order; include key share group)
+	supportedGroups := []uint16{CurveSM2, CurveX25519}
+	if keyShareGroup == CurveX25519 {
+		supportedGroups = []uint16{CurveX25519, CurveSM2}
+	}
+	supportedGroupsExt := marshalSupportedCurvesExtension(supportedGroups)
 	extensions = append(extensions, supportedGroupsExt)
 
 	// 4. session_ticket / encrypt_then_mac / extended_master_secret (empty)
@@ -1105,8 +1188,8 @@ func (c *Conn) sendClientHelloTLS13WithGroup(keyShareGroup uint16) error {
 
 	// 10. pre_shared_key (TLS 1.3 resumption) - must be last if present
 	var pskInfo *tls13PSKInfo
-	if c.config != nil && len(c.config.SessionTickets) > 0 {
-		if info := buildTLS13PSKInfo(c.config.SessionTickets); info != nil {
+	if c.config != nil {
+		if info := buildTLS13PSKInfo(c.snapshotSessionTickets()); info != nil {
 			pskInfo = info
 			extensions = append(extensions, info.Ext)
 		}
@@ -1227,6 +1310,8 @@ func buildTLS13PSKInfo(tickets []TLS13SessionTicket) *tls13PSKInfo {
 }
 
 func selectResumptionTicket(tickets []TLS13SessionTicket) *TLS13SessionTicket {
+	var best *TLS13SessionTicket
+	var bestTime time.Time
 	for i := range tickets {
 		t := &tickets[i]
 		if len(t.Ticket) == 0 || len(t.PSK) == 0 || t.Lifetime == 0 {
@@ -1238,9 +1323,12 @@ func selectResumptionTicket(tickets []TLS13SessionTicket) *TLS13SessionTicket {
 		if time.Since(t.ReceivedAt) > time.Duration(t.Lifetime)*time.Second {
 			continue
 		}
-		return t
+		if best == nil || t.ReceivedAt.After(bestTime) {
+			best = t
+			bestTime = t.ReceivedAt
+		}
 	}
-	return nil
+	return best
 }
 
 func obfuscatedTicketAge(t TLS13SessionTicket) uint32 {
@@ -1366,6 +1454,16 @@ func (c *Conn) readServerHelloTLS13() error {
 		}
 	}
 
+	for _, ext := range hello.Extensions {
+		if ext.Type == extensionPreSharedKey {
+			// If server selected PSK, it will include selected_identity.
+			if len(ext.Data) >= 2 {
+				c.tls13DidResume = true
+			}
+			break
+		}
+	}
+
 	if serverKeyShare == nil {
 		return errors.New("gmtls: server did not send key_share extension")
 	}
@@ -1475,6 +1573,12 @@ func (c *Conn) readCertificateTLS13() error {
 			}
 			c.peerCert = cert
 
+			if !c.config.InsecureSkipVerify && c.isClient {
+				if err := c.verifyServerCertificate(cert); err != nil {
+					return err
+				}
+			}
+
 			c.transcriptHash.Write(msgBytes)
 			return nil
 		default:
@@ -1483,8 +1587,35 @@ func (c *Conn) readCertificateTLS13() error {
 	}
 }
 
+func (c *Conn) readClientCertificateTLS13() error {
+	msgBytes, err := c.readTLS13HandshakeMsg()
+	if err != nil {
+		return err
+	}
+	if len(msgBytes) == 0 || msgBytes[0] != typeCertificate {
+		return fmt.Errorf("gmtls: expected client Certificate, got %d", msgBytes[0])
+	}
+	cert, err := parseCertificateTLS13(msgBytes)
+	if err != nil {
+		return err
+	}
+	c.peerCert = cert
+
+	if c.config != nil && c.config.RequireClientCert && (cert == nil || len(cert.Raw) == 0) {
+		return errors.New("gmtls: client certificate required")
+	}
+	if c.config != nil && !c.config.InsecureSkipVerify && c.config.ClientCAs != nil && cert != nil && len(cert.Raw) > 0 {
+		if err := c.verifyClientCertificate(cert); err != nil {
+			return err
+		}
+	}
+
+	c.transcriptHash.Write(msgBytes)
+	return nil
+}
+
 // readCertificateVerifyTLS13 读取 TLS 1.3 CertificateVerify
-func (c *Conn) readCertificateVerifyTLS13() error {
+func (c *Conn) readCertificateVerifyTLS13(context string) error {
 	msgBytes, err := c.readTLS13HandshakeMsg()
 	if err != nil {
 		return err
@@ -1511,7 +1642,6 @@ func (c *Conn) readCertificateVerifyTLS13() error {
 		if c.peerCert == nil || c.peerCert.PublicKey == nil {
 			return errors.New("gmtls: no peer certificate for signature verification")
 		}
-		context := "TLS 1.3, server CertificateVerify"
 		signed := tls13CertVerifySigned(context, transcriptHash)
 
 		verifyWithPub := func(pub *PublicKey) (bool, error) {
@@ -1690,14 +1820,25 @@ func (c *Conn) sendFinishedTLS13() error {
 		c.tls13ServerFinishedHash = append([]byte(nil), c.transcriptHash.Sum(nil)...)
 	}
 
-	// 启用客户端加密（若已启用则不要重置序列号）
-	if !c.clientEncrypted || c.out.cipher == nil {
-		gcm, err := NewSM4GCMMode(c.tls13KeyMaterial.ClientHandshakeKey, c.tls13KeyMaterial.ClientHandshakeIV)
-		if err != nil {
-			return err
+	// 发送 Finished 前，按角色启用正确方向的握手流量密钥。
+	if c.isClient {
+		if !c.clientEncrypted || c.out.cipher == nil {
+			gcm, err := NewSM4GCMMode(c.tls13KeyMaterial.ClientHandshakeKey, c.tls13KeyMaterial.ClientHandshakeIV)
+			if err != nil {
+				return err
+			}
+			c.out.cipher = gcm
+			c.clientEncrypted = true
 		}
-		c.out.cipher = gcm
-		c.clientEncrypted = true
+	} else {
+		if !c.serverEncrypted || c.out.cipher == nil {
+			gcm, err := NewSM4GCMMode(c.tls13KeyMaterial.ServerHandshakeKey, c.tls13KeyMaterial.ServerHandshakeIV)
+			if err != nil {
+				return err
+			}
+			c.out.cipher = gcm
+			c.serverEncrypted = true
+		}
 	}
 
 	return c.writeRecord(recordTypeHandshake, data)
@@ -1873,6 +2014,13 @@ func (c *Conn) serverHandshakeTLS13() error {
 		return err
 	}
 
+	requestClientCert := c.config != nil && (c.config.RequireClientCert || c.config.ClientCAs != nil)
+	if requestClientCert {
+		if err := c.sendCertificateRequestTLS13(); err != nil {
+			return err
+		}
+	}
+
 	// 发送 Certificate
 	if err := c.sendCertificateTLS13(); err != nil {
 		return err
@@ -1886,6 +2034,26 @@ func (c *Conn) serverHandshakeTLS13() error {
 	// 发送 Finished
 	if err := c.sendFinishedTLS13(); err != nil {
 		return err
+	}
+
+	// 服务端读取客户端后续握手消息（Certificate/CertificateVerify/Finished）前，
+	// 需启用客户端握手流量密钥进行入站解密。
+	if !c.clientEncrypted || c.in.cipher == nil {
+		gcm, err := NewSM4GCMMode(c.tls13KeyMaterial.ClientHandshakeKey, c.tls13KeyMaterial.ClientHandshakeIV)
+		if err != nil {
+			return err
+		}
+		c.clientEncrypted = true
+		c.in.cipher = gcm
+	}
+
+	if requestClientCert {
+		if err := c.readClientCertificateTLS13(); err != nil {
+			return err
+		}
+		if err := c.readCertificateVerifyTLS13("TLS 1.3, client CertificateVerify"); err != nil {
+			return err
+		}
 	}
 
 	// 接收 Finished
@@ -2080,7 +2248,7 @@ func (c *Conn) sendServerHelloTLS13() error {
 			Type: extensionSupportedVersions,
 			Data: []byte{0x03, 0x04}, // TLS 1.3
 		},
-		marshalKeyShareExtension([]KeyShareEntry{serverKeyShare}),
+		marshalKeyShareServerHelloExtension(serverKeyShare),
 	}
 
 	// 构造 ServerHello
@@ -2106,6 +2274,14 @@ func (c *Conn) sendServerHelloTLS13() error {
 
 	// 派生 TLS 1.3 密钥
 	c.deriveTLS13Keys()
+
+	// TLS 1.3: ServerHello 之后，服务端后续握手消息需使用服务端握手流量密钥加密。
+	gcm, err := NewSM4GCMMode(c.tls13KeyMaterial.ServerHandshakeKey, c.tls13KeyMaterial.ServerHandshakeIV)
+	if err != nil {
+		return fmt.Errorf("gmtls: failed to create server handshake cipher: %v", err)
+	}
+	c.serverEncrypted = true
+	c.out.cipher = gcm
 
 	return nil
 }
@@ -2142,6 +2318,16 @@ func (c *Conn) sendCertificateTLS13() error {
 	c.transcriptHash.Write(data)
 
 	// 作为握手记录发送
+	return c.writeRecord(recordTypeHandshake, data)
+}
+
+func (c *Conn) sendCertificateRequestTLS13() error {
+	sigSchemes := []uint16{SM2SM3}
+	if len(c.clientSigSchemes) > 0 {
+		sigSchemes = c.clientSigSchemes
+	}
+	data := marshalCertificateRequestTLS13(sigSchemes)
+	c.transcriptHash.Write(data)
 	return c.writeRecord(recordTypeHandshake, data)
 }
 
@@ -2190,6 +2376,7 @@ func (c *Conn) ConnectionState() ConnectionState {
 		ServerName:        c.serverName,
 		PeerCertificates:  []*Certificate{c.peerCert},
 		HandshakeComplete: c.handshakeComplete,
+		DidResume:         c.tls13DidResume,
 	}
 }
 
@@ -2201,6 +2388,7 @@ type ConnectionState struct {
 	ServerName        string         // SNI 服务器名称
 	PeerCertificates  []*Certificate // 对等方证书链
 	HandshakeComplete bool           // 握手是否完成
+	DidResume         bool           // TLS 1.3 session resumption (client)
 }
 
 // GetConnectionState 返回连接状态（替代方法）

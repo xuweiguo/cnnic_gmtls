@@ -2,6 +2,7 @@ package gmtls
 
 import (
 	"net"
+	"sync"
 	"time"
 )
 
@@ -133,7 +134,20 @@ func (c *Config) Clone() *Config {
 	if c == nil {
 		return &Config{}
 	}
-	cc := *c
+	cc := Config{
+		PrivateKey:         c.PrivateKey,
+		SignPrivateKey:     c.SignPrivateKey,
+		EncPrivateKey:      c.EncPrivateKey,
+		InsecureSkipVerify: c.InsecureSkipVerify,
+		RequireClientCert:  c.RequireClientCert,
+		MinVersion:         c.MinVersion,
+		MaxVersion:         c.MaxVersion,
+		RootCAs:            c.RootCAs,
+		ClientCAs:          c.ClientCAs,
+		ServerName:         c.ServerName,
+		OnNewSessionTicket: c.OnNewSessionTicket,
+		SessionTicketLimit: c.SessionTicketLimit,
+	}
 	if c.CipherSuites != nil {
 		cc.CipherSuites = append([]uint16(nil), c.CipherSuites...)
 	}
@@ -164,5 +178,6 @@ func (c *Config) Clone() *Config {
 			}
 		}
 	}
+	cc.sessionTicketsMu = sync.Mutex{}
 	return &cc
 }

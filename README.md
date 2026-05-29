@@ -9,13 +9,14 @@
 - TLS 1.3 GM 套件（SM2/SM3/SM4）与会话恢复支持
 - 兼容 Tongsuo/BabaSSL 的非标准握手细节
 - CNNIC EPP 客户端示例与探测工具
+- 支持服务端证书链验证与可选客户端证书认证
 
 **互通策略（Tongsuo/BabaSSL）**
 - TLS 1.3 套件优先 `0x00C6/0x00C7`，并兼容 `0x1306/0x1307`
-- `key_share` 固定为 `SM2`
+- `key_share` 默认 `SM2`，可根据协商回退/切换到 `X25519`
 - `signature_algorithms` 仅发送 `sm2sig_sm3`
 - 客户端 `CertificateVerify` 使用 `HANDSHAKE_SM2_ID`
-- 握手完成后的 `NewSessionTicket` 解析后忽略，不影响应用层读取
+- 握手完成后的 `NewSessionTicket` 会缓存到 `Config.SessionTickets`
 
 ## 安装
 
@@ -41,7 +42,7 @@ go run ./cmd/cnnic_epp -config cnnic/config.yml -action hello
 
 参数说明：
 - `-config`：配置文件路径（例如 `cnnic/config.yml`）
-- `-action`：`hello` 或 `login`
+- `-action`：`hello`、`login` 或 `check`
 
 ### 其他命令
 
@@ -87,6 +88,9 @@ cfg := &gmtls.Config{
 	},
 }
 conn, err := gmtls.Dial("tcp", "example.com:443", cfg)
+if err == nil {
+	fmt.Println("resumed:", conn.ConnectionState().DidResume)
+}
 ```
 
 ### 双证书（签名/加密分离）
@@ -105,10 +109,23 @@ ln, err := gmtls.Listen("tcp", ":8443", &gmtls.Config{
 })
 ```
 
-客户端证书链验证（服务端侧）：
+服务端校验客户端证书（TLS 1.3）：
 
-当前实现只验证客户端对私钥的持有（CertificateVerify），不自动验证证书链。
-如需校验客户端证书合法性，可在握手完成后自行验证，例如：
+```go
+import "github.com/emmansun/gmsm/smx509"
+
+clientCAPool := smx509.NewCertPool()
+// clientCAPool.AddCert(...)
+
+ln, err := gmtls.Listen("tcp", ":8443", &gmtls.Config{
+	Certificates:     []*gmtls.Certificate{signCert},
+	PrivateKey:       signKey,
+	RequireClientCert: true,
+	ClientCAs:         clientCAPool,
+})
+```
+
+如果不启用 `RequireClientCert`，服务端仍可在握手后自行校验：
 
 ```go
 import "github.com/emmansun/gmsm/smx509"
@@ -167,8 +184,8 @@ go test ./...
 
 - 当前实现仅支持 TLS 1.3；`MinVersion/MaxVersion` 与 TLS 1.2 相关配置不会生效。
 - 客户端 `CipherSuites` 在 TLS 1.3 中固定为 `0x00C6/0x00C7` 优先（并兼容 `0x1306/0x1307`），不接受自定义顺序。
-- 客户端 `key_share` 固定为 `SM2`（除非显式使用 X25519 分支），可能不满足部分服务端的组协商要求。
-- 证书链不会自动验证，需业务侧自行校验。
+- 客户端 `key_share` 默认 `SM2`，在 `HelloRetryRequest` 时可能切换到 `X25519`。
+- 若未配置 `RootCAs/ClientCAs`，证书链验证可能退化为系统默认或跳过（取决于 `InsecureSkipVerify`）。
 
 ## License
 

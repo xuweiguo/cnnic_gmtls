@@ -76,8 +76,8 @@ func parseCertificateTLS13(data []byte) (*Certificate, error) {
 	if len(data) < off+listLen {
 		return nil, errors.New("gmtls: invalid Certificate list length")
 	}
-	if listLen < 3 {
-		return nil, errors.New("gmtls: empty Certificate list")
+	if listLen == 0 {
+		return &Certificate{}, nil
 	}
 
 	entriesEnd := off + listLen
@@ -129,4 +129,45 @@ func parseCertificateRequestTLS13(data []byte) ([]byte, error) {
 	copy(context, data[off:off+ctxLen])
 	// extensions length follows; ignore contents for now
 	return context, nil
+}
+
+func marshalCertificateRequestTLS13(sigSchemes []uint16) []byte {
+	// CertificateRequest: context(1) + context + extensions
+	if len(sigSchemes) == 0 {
+		sigSchemes = []uint16{SM2SM3}
+	}
+	exts := []Extension{
+		marshalSignatureAlgorithmsExtension(sigSchemes),
+		marshalSignatureAlgorithmsCertExtension(sigSchemes),
+	}
+
+	extLen := 0
+	for _, ext := range exts {
+		if ext.Type == 0 && len(ext.Data) == 0 {
+			continue
+		}
+		extLen += 4 + len(ext.Data)
+	}
+
+	msgLen := 1 + 0 + 2 + extLen
+	data := make([]byte, 4+msgLen)
+	data[0] = typeCertificateRequest
+	writeUint24(data[1:4], msgLen)
+	off := 4
+	data[off] = 0
+	off++
+	// extensions length
+	binary.BigEndian.PutUint16(data[off:off+2], uint16(extLen))
+	off += 2
+	for _, ext := range exts {
+		if ext.Type == 0 && len(ext.Data) == 0 {
+			continue
+		}
+		binary.BigEndian.PutUint16(data[off:off+2], ext.Type)
+		binary.BigEndian.PutUint16(data[off+2:off+4], uint16(len(ext.Data)))
+		off += 4
+		copy(data[off:off+len(ext.Data)], ext.Data)
+		off += len(ext.Data)
+	}
+	return data
 }
