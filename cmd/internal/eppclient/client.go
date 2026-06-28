@@ -100,8 +100,9 @@ func run(opts cliOptions, stdout io.Writer) error {
 			MinVersion:         gmtls.VersionTLS12,
 			MaxVersion:         gmtls.VersionTLS13,
 			InsecureSkipVerify: opts.insecure,
-			// CNNIC EPP 服务器证书 CN=server(通用名,非域名)且无 SAN,
-			// 跳过主机名校验,仅做证书链 + 有效期 + 用途校验。
+			// CNNIC EPP 服务器证书 CN=server(通用名,非域名)且无 SAN,其证书本身
+			// 不携带可校验的主机名,故主机名校验对 CNNIC 场景永久跳过;严格模式下
+			// 仍校验证书链(RootCAs)+ 有效期 + 用途,安全性由 CA 信任锚保证。
 			SkipServerNameVerify: true,
 		}
 
@@ -111,14 +112,18 @@ func run(opts cliOptions, stdout io.Writer) error {
 		}
 
 		// 严格校验:加载 CA(与客户端证书同目录的 ca.crt)用于验证服务器证书链。
+		// CA 缺失或损坏属于配置错误,严格模式下必须硬失败并指明路径,而非静默
+		// 降级到系统证书池(否则会以晦涩的 x509 报错掩盖根因)。
 		if !opts.insecure {
 			caPath := filepath.Join(baseDir, "gm", "ca.crt")
 			if _, err := os.Stat(caPath); err != nil {
 				caPath = filepath.Join(baseDir, "ca.crt")
 			}
-			if pool, err := gmtls.LoadCertPoolFromPEM(caPath); err == nil {
-				config.RootCAs = pool
+			pool, err := gmtls.LoadCertPoolFromPEM(caPath)
+			if err != nil {
+				return fmt.Errorf("strict mode requires CA pool, failed to load %s: %w", caPath, err)
 			}
+			config.RootCAs = pool
 		}
 
 		loadCertWithChain := func(certPath string) (*gmtls.Certificate, error) {

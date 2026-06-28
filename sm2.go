@@ -195,18 +195,6 @@ func SignMessageNoZA(priv *PrivateKey, msg []byte) (*Signature, error) {
 	return signatureFromASN1(sigDER)
 }
 
-func verifyHashNoZA(pub *PublicKey, hash []byte, sig *Signature) bool {
-	if !validSignatureInput(pub, sig) {
-		return false
-	}
-	der, err := signatureToASN1(sig)
-	if err != nil {
-		return false
-	}
-	ecdsaPub := &ecdsa.PublicKey{Curve: SM2Curve, X: pub.X, Y: pub.Y}
-	return sm2.VerifyASN1(ecdsaPub, hash, der)
-}
-
 // Encrypt 使用 SM2 加密。
 func Encrypt(pub *PublicKey, plaintext []byte) ([]byte, error) {
 	if pub == nil {
@@ -287,24 +275,4 @@ func signatureToASN1(sig *Signature) ([]byte, error) {
 		return nil, errors.New("sm2: invalid signature")
 	}
 	return asn1.Marshal(*sig)
-}
-
-func sm2ComputeZA(userID []byte, pub *PublicKey) []byte {
-	if pub == nil {
-		return nil
-	}
-	ecdsaPub := &ecdsa.PublicKey{Curve: SM2Curve, X: pub.X, Y: pub.Y}
-	za, err := sm2.CalculateZA(ecdsaPub, userID)
-	if err != nil {
-		return nil
-	}
-	return za
-}
-
-func sm2ComputeE(za, m []byte) *big.Int {
-	h := NewSM3()
-	_, _ = h.Write(za)
-	_, _ = h.Write(m)
-	sum := h.Sum(nil)
-	return new(big.Int).SetBytes(sum)
 }
