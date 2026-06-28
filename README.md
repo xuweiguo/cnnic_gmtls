@@ -66,11 +66,34 @@ conn, err := gmtls.Dial("tcp", "example.com:443", &gmtls.Config{
 服务端：
 
 ```go
-cert, key, _ := gmtls.LoadX509KeyPair("server.crt", "server.key")
+cert, key, _ := gmtls.LoadGMKeyPair("server.crt", "server.key", "passw0rd")
 ln, err := gmtls.Listen("tcp", ":8443", &gmtls.Config{
 	Certificates: []*gmtls.Certificate{cert},
 	PrivateKey:   key,
 })
+```
+
+### 便利 API（推荐用于客户端）
+
+`LoadGMKeyPair` 和 `GMClientConfig` 封装了证书/私钥/CA 加载与校验开关，
+避免手写并误用 `InsecureSkipVerify`。CNNIC EPP 这类场景（双向客户端证书 +
+自签 CA 严格校验 + 服务器证书 CN 为通用名）一行即可构建：
+
+```go
+cfg, err := gmtls.GMClientConfig(gmtls.GMClientOptions{
+	ServerName:           "epp.example.cn",
+	CertPath:             "client.crt",   // 可含完整证书链
+	KeyPath:              "client.key",   // 加密私钥
+	KeyPassword:          "passw0rd",
+	RootCAsPath:          "ca.crt",       // 严格校验服务器证书链
+	SkipServerNameVerify: true,           // 服务器证书无 SAN 时跳过主机名
+})
+conn, err := gmtls.Dial("tcp", "epp.example.cn:3121", cfg)
+```
+
+- 不设 `RootCAsPath` 则回退系统证书池；设了则严格校验，缺/坏 CA 会直接报错。
+- `InsecureSkipVerify` 仅用于调试；默认严格校验。
+
 ```
 
 ## 使用示例

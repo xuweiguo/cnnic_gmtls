@@ -1,6 +1,7 @@
 package gmtls
 
 import (
+	"errors"
 	"net"
 	"sync"
 	"time"
@@ -181,4 +182,91 @@ func (c *Config) Clone() *Config {
 	}
 	cc.sessionTicketsMu = sync.Mutex{}
 	return &cc
+}
+
+// ============= 便利 API(基于 CNNIC EPP 实战经验)=============
+
+// LoadGMKeyPair 一次性加载 SM2 客户端证书与加密私钥,便于双向认证。
+// crtPath 的 PEM 文件可含完整证书链(leaf+中间+根),Chain 字段会自动填充。
+// keyPath 为加密的 SM2 私钥,keyPassword 为其口令。
+func LoadGMKeyPair(crtPath, keyPath, keyPassword string) (*Certificate, *PrivateKey, error) {
+	cert, err := LoadCertificateFromPEM(crtPath)
+	if err != nil {
+		return nil, nil, err
+	}
+	key, err := LoadSM2PrivateKeyFromPEM(keyPath, keyPassword)
+	if err != nil {
+		return nil, nil, err
+	}
+	return cert, key, nil
+}
+
+// GMClientOptions 是构建 GM TLS 客户端 Config 的便利选项。
+// 设计上覆盖 CNNIC EPP 这类场景:双向客户端证书 + 自签 CA 严格校验 +
+// 服务器证书 CN 为通用名(无 SAN)时跳过主机名校验。
+type GMClientOptions struct {
+	// ServerName 用作 SNI。EPP 服务器证书 CN 为通用名(非域名)时可留空,
+	// 配合 SkipServerNameVerify=true 跳过主机名校验。
+	ServerName string
+
+	// 客户端证书与私钥(双向认证)。CertPath 为空则不带客户端证书。
+	CertPath    string
+	KeyPath     string
+	KeyPassword string
+
+	// RootCAsPath 为 CA(PEM)文件路径,用于严格校验服务器证书链。
+	// 为空时不设置 RootCAs(回退到系统证书池)。
+	RootCAsPath string
+
+	// SkipServerNameVerify 跳过证书 DNSName/SAN 校验。
+	// 服务器证书 CN 为通用名(如 CNNIC EPP 的 CN=server)且无 SAN 时需要。
+	SkipServerNameVerify bool
+
+	// InsecureSkipVerify 跳过全部服务器证书校验,仅用于调试/互通排查。
+	InsecureSkipVerify bool
+
+	// MinVersion/MaxVersion 限定 TLS 版本,默认由 Config 自身默认值决定。
+	MinVersion uint16
+	MaxVersion uint16
+}
+
+// GMClientConfig 按选项构建一个安全可用的 GM TLS 客户端 Config,
+// 封装证书/私钥/CA 加载与校验开关,避免调用方手写并误用 InsecureSkipVerify。
+//
+// 调用方随后用 gmtls.Dial("tcp", host, cfg) 即可建立严格校验的国密 TLS 连接。
+// 典型用法见 cmd/internal/eppclient 与 README。
+func GMClientConfig(opts GMClientOptions) (*Config, error) {
+	cfg := &Config{
+		ServerName:           opts.ServerName,
+		InsecureSkipVerify:   opts.InsecureSkipVerify,
+		SkipServerNameVerify: opts.SkipServerNameVerify,
+		MinVersion:           opts.MinVersion,
+		MaxVersion:           opts.MaxVersion,
+	}
+
+	// 加载并设置客户端证书与私钥(双向认证)。
+	if opts.CertPath != "" || opts.KeyPath != "" {
+		if opts.CertPath == "" || opts.KeyPath == "" {
+			return nil, errors.New("gmtls: GMClientConfig requires both CertPath and KeyPath")
+		}
+		cert, key, err := LoadGMKeyPair(opts.CertPath, opts.KeyPath, opts.KeyPassword)
+		if err != nil {
+			return nil, err
+		}
+		cfg.Certificates = []*Certificate{cert}
+		cfg.PrivateKey = key
+		cfg.SignCertificates = []*Certificate{cert}
+		cfg.SignPrivateKey = key
+	}
+
+	// 加载 CA 池用于严格校验服务器证书链。
+	if opts.RootCAsPath != "" {
+		pool, err := LoadCertPoolFromPEM(opts.RootCAsPath)
+		if err != nil {
+			return nil, err
+		}
+		cfg.RootCAs = pool
+	}
+
+	return cfg, nil
 }
