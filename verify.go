@@ -20,6 +20,11 @@ func (c *Conn) verifyServerCertificate(cert *Certificate) error {
 	if c.config != nil && c.config.ServerName != "" {
 		serverName = c.config.ServerName
 	}
+	// 服务器证书为通用名(非域名)、不含 SAN 时(CNNIC EPP 服务器 CN=server),
+	// 跳过主机名校验,只做证书链 + 有效期 + 用途校验。
+	if c.config != nil && c.config.SkipServerNameVerify {
+		serverName = ""
+	}
 
 	return c.verifyPeerCertificate(cert, roots, smx509.ExtKeyUsageServerAuth, serverName)
 }

@@ -15,7 +15,8 @@
 - TLS 1.3 套件优先 `0x00C6/0x00C7`，并兼容 `0x1306/0x1307`
 - `key_share` 默认 `SM2`，可根据协商回退/切换到 `X25519`
 - `signature_algorithms` 仅发送 `sm2sig_sm3`
-- 客户端 `CertificateVerify` 使用 `HANDSHAKE_SM2_ID`
+- TLS 1.3 `CertificateVerify`（客户端与服务端双向）均按 RFC 8998 §3.2.1 使用 `HANDSHAKE_SM2_ID`（`TLSv1.3+GM+Cipher+Suite`）签名/验签；`CERTVRIFY_SM2_ID`（`1234567812345678`）仅用于 X.509 证书链签名验证
+- 严格校验（`InsecureSkipVerify=false`）下，客户端用 `Config.RootCAs` 验证服务器证书链；`Config.SkipServerNameVerify` 用于服务器证书 CN 为通用名且无 SAN（如 CNNIC EPP 服务器 `CN=server`）时跳过主机名校验
 - 握手完成后的 `NewSessionTicket` 会缓存到 `Config.SessionTickets`
 
 ## 安装

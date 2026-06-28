@@ -100,11 +100,25 @@ func run(opts cliOptions, stdout io.Writer) error {
 			MinVersion:         gmtls.VersionTLS12,
 			MaxVersion:         gmtls.VersionTLS13,
 			InsecureSkipVerify: opts.insecure,
+			// CNNIC EPP 服务器证书 CN=server(通用名,非域名)且无 SAN,
+			// 跳过主机名校验,仅做证书链 + 有效期 + 用途校验。
+			SkipServerNameVerify: true,
 		}
 
 		baseDir := "."
 		if idx := strings.LastIndex(opts.configPath, string(os.PathSeparator)); idx >= 0 {
 			baseDir = opts.configPath[:idx]
+		}
+
+		// 严格校验:加载 CA(与客户端证书同目录的 ca.crt)用于验证服务器证书链。
+		if !opts.insecure {
+			caPath := filepath.Join(baseDir, "gm", "ca.crt")
+			if _, err := os.Stat(caPath); err != nil {
+				caPath = filepath.Join(baseDir, "ca.crt")
+			}
+			if pool, err := gmtls.LoadCertPoolFromPEM(caPath); err == nil {
+				config.RootCAs = pool
+			}
 		}
 
 		loadCertWithChain := func(certPath string) (*gmtls.Certificate, error) {

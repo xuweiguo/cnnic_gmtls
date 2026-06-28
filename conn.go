@@ -2,7 +2,6 @@ package gmtls
 
 import (
 	"bytes"
-	"crypto/ecdsa"
 	"crypto/rand"
 	"encoding/binary"
 	"errors"
@@ -408,11 +407,15 @@ type Config struct {
 	EncCertificates    []*Certificate
 	EncPrivateKey      *PrivateKey
 	InsecureSkipVerify bool
-	RequireClientCert  bool
-	MinVersion         uint16 // 最低 TLS 版本
-	MaxVersion         uint16 // 最高 TLS 版本
-	RootCAs            *smx509.CertPool
-	ClientCAs          *smx509.CertPool
+	// SkipServerNameVerify 跳过证书的 DNSName/SAN 校验。用于服务器证书 CN 为通用名
+	// (非域名)且不含 SAN 的场景(如 CNNIC EPP 服务器 CN=server),此时仅校验证书链与
+	// 有效期/用途,不校验主机名匹配。
+	SkipServerNameVerify bool
+	RequireClientCert    bool
+	MinVersion           uint16 // 最低 TLS 版本
+	MaxVersion           uint16 // 最高 TLS 版本
+	RootCAs              *smx509.CertPool
+	ClientCAs            *smx509.CertPool
 
 	// 扩展配置
 	ServerName string   // SNI - 服务端名称指示
@@ -1645,56 +1648,27 @@ func (c *Conn) readCertificateVerifyTLS13(context string) error {
 		signed := tls13CertVerifySigned(context, transcriptHash)
 
 		verifyWithPub := func(pub *PublicKey) (bool, error) {
-			ok, err := sm2TLS13VerifyWithID(pub, signed, msg.Signature, sm2TLS13CertVerifyID())
+			// RFC 8998 §3.2.1: TLS 1.3 CertificateVerify 的 SM2 签名使用
+			// HANDSHAKE_SM2_ID ("TLSv1.3+GM+Cipher+Suite"),与 Tongsuo/BabaSSL
+			// 在 tls_construct_cert_verify 中通过 EVP_PKEY_CTX_set1_id 设置的 ID 一致。
+			// 注意:CERTVRIFY_SM2_ID ("1234567812345678") 仅用于 X.509 证书链签名验证,
+			// 不能用于 CertificateVerify 消息本身。
+			ok, err := sm2TLS13VerifyWithID(pub, signed, msg.Signature, sm2TLS13HandshakeID())
 			if err != nil {
 				return false, err
 			}
 			if ok {
 				return true, nil
 			}
-			// Fallback: some servers sign SM3(msg) without ZA (non-standard).
+			// Fallback: 极少数历史非标准服务器可能用 CERTVRIFY ID 签名。
+			if altOk, altErr := sm2TLS13VerifyWithID(pub, signed, msg.Signature, sm2TLS13CertVerifyID()); altErr != nil {
+				return false, altErr
+			} else if altOk {
+				return true, nil
+			}
+			// Fallback: 一些服务器对 SM3(msg) 做 ECDSA 风格签名(不含 ZA,非标准)。
 			if VerifyMessageNoZA(pub, signed, sig) {
 				c.tls13SM2NoZA = true
-				return true, nil
-			}
-			// Fallback: ZA + SM3(Signed) (non-standard).
-			signedHash := SM3(signed)
-			if altOk, altErr := sm2TLS13VerifyWithID(pub, signedHash[:], msg.Signature, sm2TLS13CertVerifyID()); altErr != nil {
-				return false, altErr
-			} else if altOk {
-				return true, nil
-			}
-			// Fallback: sign transcript hash directly (non-standard).
-			if altOk, altErr := sm2TLS13VerifyWithID(pub, transcriptHash, msg.Signature, sm2TLS13CertVerifyID()); altErr != nil {
-				return false, altErr
-			} else if altOk {
-				return true, nil
-			}
-			th := SM3(transcriptHash)
-			if altOk, altErr := sm2TLS13VerifyWithID(pub, th[:], msg.Signature, sm2TLS13CertVerifyID()); altErr != nil {
-				return false, altErr
-			} else if altOk {
-				return true, nil
-			}
-			if verifyHashNoZA(pub, transcriptHash, sig) {
-				c.tls13SM2NoZA = true
-				return true, nil
-			}
-			if verifyHashNoZA(pub, th[:], sig) {
-				c.tls13SM2NoZA = true
-				return true, nil
-			}
-			// Fallback: ECDSA over SM2 curve with SM3(signed) (no ZA).
-			ecdsaPub := &ecdsa.PublicKey{Curve: SM2Curve, X: pub.X, Y: pub.Y}
-			h := SM3(signed)
-			if ecdsa.Verify(ecdsaPub, h[:], sig.R, sig.S) {
-				return true, nil
-			}
-			// Fallback: ECDSA over SM2 curve with SM3(ZA||signed).
-			za := sm2ComputeZA(sm2TLS13CertVerifyID(), pub)
-			zaMsg := append(za, signed...)
-			h2 := SM3(zaMsg)
-			if ecdsa.Verify(ecdsaPub, h2[:], sig.R, sig.S) {
 				return true, nil
 			}
 			return false, nil
@@ -2336,8 +2310,13 @@ func (c *Conn) sendCertificateVerifyTLS13() error {
 	// 计算 transcript hash
 	transcriptHash := c.transcriptHash.Sum(nil)
 
-	// 计算待签名的数据（TLS 1.3 格式）
+	// 计算待签名的数据（TLS 1.3 格式）。RFC 8446 §4.4.3 规定 context 字符串
+	// 由角色决定:服务端用 "TLS 1.3, server CertificateVerify",
+	// 客户端用 "TLS 1.3, client CertificateVerify"。
 	context := "TLS 1.3, client CertificateVerify"
+	if !c.isClient {
+		context = "TLS 1.3, server CertificateVerify"
+	}
 	signed := tls13CertVerifySigned(context, transcriptHash)
 
 	// 使用本地私钥对原始消息签名

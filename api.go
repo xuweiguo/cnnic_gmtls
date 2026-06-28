@@ -135,18 +135,19 @@ func (c *Config) Clone() *Config {
 		return &Config{}
 	}
 	cc := Config{
-		PrivateKey:         c.PrivateKey,
-		SignPrivateKey:     c.SignPrivateKey,
-		EncPrivateKey:      c.EncPrivateKey,
-		InsecureSkipVerify: c.InsecureSkipVerify,
-		RequireClientCert:  c.RequireClientCert,
-		MinVersion:         c.MinVersion,
-		MaxVersion:         c.MaxVersion,
-		RootCAs:            c.RootCAs,
-		ClientCAs:          c.ClientCAs,
-		ServerName:         c.ServerName,
-		OnNewSessionTicket: c.OnNewSessionTicket,
-		SessionTicketLimit: c.SessionTicketLimit,
+		PrivateKey:           c.PrivateKey,
+		SignPrivateKey:       c.SignPrivateKey,
+		EncPrivateKey:        c.EncPrivateKey,
+		InsecureSkipVerify:   c.InsecureSkipVerify,
+		SkipServerNameVerify: c.SkipServerNameVerify,
+		RequireClientCert:    c.RequireClientCert,
+		MinVersion:           c.MinVersion,
+		MaxVersion:           c.MaxVersion,
+		RootCAs:              c.RootCAs,
+		ClientCAs:            c.ClientCAs,
+		ServerName:           c.ServerName,
+		OnNewSessionTicket:   c.OnNewSessionTicket,
+		SessionTicketLimit:   c.SessionTicketLimit,
 	}
 	if c.CipherSuites != nil {
 		cc.CipherSuites = append([]uint16(nil), c.CipherSuites...)

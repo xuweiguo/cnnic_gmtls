@@ -15,12 +15,14 @@ func sm2UserID() []byte {
 }
 
 func sm2TLS13CertVerifyID() []byte {
-	// Tongsuo CERTVRIFY_SM2_ID
+	// CERTVRIFY_SM2_ID (Tongsuo): 仅用于 X.509 证书链签名验证(GM/T 0009-2012 默认 SM2 ID),
+	// 不用于 TLS 1.3 CertificateVerify 消息本身的签名/验签。
 	return []byte("1234567812345678")
 }
 
 func sm2TLS13HandshakeID() []byte {
-	// Tongsuo HANDSHAKE_SM2_ID
+	// HANDSHAKE_SM2_ID (Tongsuo): RFC 8998 §3.2.1 规定的 TLS 1.3 CertificateVerify
+	// 消息签名/验签所用 SM2 ID,与服务端/客户端签名两端保持一致。
 	return []byte("TLSv1.3+GM+Cipher+Suite")
 }
 
