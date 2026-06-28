@@ -19,13 +19,13 @@ const (
 	TLS_SM2_WITH_SM4_CCM_SM3    uint16 = 0xE4 // 0x00E4
 	TLS_SM2DHE_WITH_SM4_CCM_SM3 uint16 = 0xE5 // 0x00E5
 
-	// TLS 1.3 国密密码套件（标准值）
-	TLS_SM4_GCM_SM3 uint16 = 0x1306 // RFC 8446 标准值
-	TLS_SM4_CCM_SM3 uint16 = 0x1307 // RFC 8446 标准值
-
-	// 兼容：BabaSSL/Tongsuo 可能使用的非标准值
-	TLS_SM4_GCM_SM3_ALT uint16 = 0x00C6 // 可能的 BabaSSL 值
-	TLS_SM4_CCM_SM3_ALT uint16 = 0x00C7 // 可能的 BabaSSL 值
+	// TLS 1.3 国密密码套件
+	// RFC 8998 §2 规定:ECC-SM4-GCM-SM3 = {0x00,0xC6}、ECC-SM4-CCM-SM3 = {0x00,0xC7}。
+	// 0x1306/0x1307 在任何 RFC/IANA 均无赋值,仅作备用占位值保留。
+	TLS_SM4_GCM_SM3     uint16 = 0x1306 // 备用值(RFC 8998 标准值为 0x00C6)
+	TLS_SM4_CCM_SM3     uint16 = 0x1307 // 备用值(RFC 8998 标准值为 0x00C7)
+	TLS_SM4_GCM_SM3_ALT uint16 = 0x00C6 // RFC 8998 标准值 ECC-SM4-GCM-SM3
+	TLS_SM4_CCM_SM3_ALT uint16 = 0x00C7 // RFC 8998 标准值 ECC-SM4-CCM-SM3
 )
 
 // CipherSuiteInfo 密码套件信息

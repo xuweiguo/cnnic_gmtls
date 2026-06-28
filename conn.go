@@ -76,25 +76,30 @@ var helloRetryRequestRandom = []byte{
 	0x07, 0x9E, 0x09, 0xE2, 0xC8, 0xA8, 0x33, 0x9C,
 }
 
+// stripTLS13InnerContentType 剥离 TLS 1.3 记录的内层类型与零填充。
+// RFC 8446 §5.2: TLSInnerPlaintext = content || ContentType || zeros[padding]。
+// 即从明文末尾向前跳过所有 0x00 填充,遇到的第一个非零字节即 ContentType,其前为 content。
 func stripTLS13InnerContentType(data []byte) ([]byte, recordType, error) {
 	if len(data) == 0 {
 		return nil, 0, errors.New("gmtls: empty TLS 1.3 record")
 	}
-	innerType := recordType(data[len(data)-1])
-	content := data[:len(data)-1]
-	i := len(content)
-	for i > 0 && content[i-1] == 0 {
-		i--
+	// 从末尾向前跳过零填充。
+	end := len(data)
+	for end > 0 && data[end-1] == 0 {
+		end--
 	}
-	return content[:i], innerType, nil
+	if end == 0 {
+		return nil, 0, errors.New("gmtls: TLS 1.3 record has no inner content type")
+	}
+	innerType := recordType(data[end-1])
+	content := data[:end-1]
+	return content, innerType, nil
 }
 
+// extractTLS13InnerContentType 与 stripTLS13InnerContentType 等价,
+// 按 RFC 8446 §5.2 正确处理零填充。
 func extractTLS13InnerContentType(data []byte) ([]byte, recordType, error) {
-	if len(data) == 0 {
-		return nil, 0, errors.New("gmtls: empty TLS 1.3 record")
-	}
-	innerType := recordType(data[len(data)-1])
-	return data[:len(data)-1], innerType, nil
+	return stripTLS13InnerContentType(data)
 }
 
 func isTLS13InnerTypeByte(b byte) bool {
@@ -148,9 +153,6 @@ func (c *Conn) readTLS13HandshakeMsg() ([]byte, error) {
 		}
 
 		c.tls13HandshakeBuf = append(c.tls13HandshakeBuf, plaintext...)
-		for len(c.tls13HandshakeBuf) > 0 && c.tls13HandshakeBuf[0] == 0 {
-			c.tls13HandshakeBuf = c.tls13HandshakeBuf[1:]
-		}
 	}
 }
 
@@ -268,7 +270,6 @@ type Conn struct {
 	tls13ClientHelloCnt int
 	tls13DidResume      bool
 	nextRecordVersion   uint16
-	tls13SM2NoZA        bool
 	tls13HandshakeBuf   []byte
 	tls13Tickets        []TLS13SessionTicket
 
@@ -1076,12 +1077,12 @@ func (c *Conn) sendClientHelloTLS13() error {
 }
 
 func (c *Conn) sendClientHelloTLS13WithGroup(keyShareGroup uint16) error {
-	// 固定 TLS 1.3 密码套件顺序，优先 0x00C6/0x00C7 以兼容 Tongsuo
+	// TLS 1.3 密码套件顺序:优先 0x00C6/0x00C7(RFC 8998 标准值,Tongsuo/BabaSSL 使用)。
+	// 本实现仅实现了 SM4-GCM(0x00C6/0x1306),未实现 SM4-CCM,故不发送 CCM 套件,
+	// 避免与对端协商到无法加解密的 CCM 套件。
 	suites := []uint16{
-		TLS_SM4_GCM_SM3_ALT, // 0x00C6 (BabaSSL/Tongsuo compat)
-		TLS_SM4_CCM_SM3_ALT, // 0x00C7 (BabaSSL/Tongsuo compat)
-		TLS_SM4_GCM_SM3,     // 0x1306 (RFC 8998)
-		TLS_SM4_CCM_SM3,     // 0x1307 (RFC 8998)
+		TLS_SM4_GCM_SM3_ALT, // 0x00C6 (RFC 8998: ECC-SM4-GCM-SM3)
+		TLS_SM4_GCM_SM3,     // 0x1306 (备用值)
 	}
 	c.clientCipherSuites = append([]uint16(nil), suites...)
 
@@ -1471,6 +1472,25 @@ func (c *Conn) readServerHelloTLS13() error {
 		return errors.New("gmtls: server did not send key_share extension")
 	}
 
+	// RFC 8446 §4.2.1:协商 TLS 1.3 的服务端必须在 ServerHello 含 supported_versions 扩展,
+	// 且其值为 0x0304。若缺失或版本不可接受,客户端必须以 protocol_version alert 中止。
+	supportedVersionOK := false
+	for _, ext := range hello.Extensions {
+		if ext.Type == extensionSupportedVersions {
+			if len(ext.Data) != 2 {
+				return errors.New("gmtls: invalid supported_versions extension in ServerHello")
+			}
+			if binary.BigEndian.Uint16(ext.Data) != VersionTLS13 {
+				return fmt.Errorf("gmtls: server selected unsupported version 0x%04x", binary.BigEndian.Uint16(ext.Data))
+			}
+			supportedVersionOK = true
+			break
+		}
+	}
+	if !supportedVersionOK {
+		return errors.New("gmtls: server did not send supported_versions extension")
+	}
+
 	// 根据服务器选择的组使用对应的私钥
 	var sharedSecret []byte
 	var err error
@@ -1489,7 +1509,10 @@ func (c *Conn) readServerHelloTLS13() error {
 		sm2PrivKey := c.tls13KeyMaterial.ClientPrivateShare.(*PrivateKey)
 
 		// 计算 ECDH 共享密钥（x 坐标）
-		ecdhSecret := DeriveSM2ECDHSharedSecret(sm2PrivKey, serverPubKey)
+		ecdhSecret, err := DeriveSM2ECDHSharedSecret(sm2PrivKey, serverPubKey)
+		if err != nil {
+			return fmt.Errorf("gmtls: failed to derive SM2 shared secret: %v", err)
+		}
 
 		// RFC 8998 Section 6.1: For SM2 cipher suites in TLS 1.3,
 		// the ECDH shared secret is the x-coordinate of the shared point
@@ -1630,73 +1653,35 @@ func (c *Conn) readCertificateVerifyTLS13(context string) error {
 		return err
 	}
 
+	// RFC 8446 §4.4.3:CertificateVerify 的签名算法必须与协商的签名算法一致。
+	// 本实现仅协商 sm2sig_sm3(0x0708),故 Algorithm 字段必须为 SM2SM3。
+	if msg.Algorithm != SM2SM3 {
+		return fmt.Errorf("gmtls: CertificateVerify has unexpected signature algorithm 0x%04x, want 0x%04x", msg.Algorithm, SM2SM3)
+	}
+
 	// 验证签名
 	transcriptHash := c.transcriptHash.Sum(nil)
-
-	sig, err := parseSM2Signature(msg.Signature)
-	if err != nil {
-		return err
-	}
 
 	if c.config != nil && c.config.InsecureSkipVerify {
 		// skip verification for interop/debugging
 	} else {
-		// 使用对等方的公钥验证签名
+		// 使用对等方的公钥验证签名。
+		// RFC 8446 §4.4.3:签名必须且只能用对端终端实体(EE)证书的公钥验证,
+		// 不得用证书链中其它(中间 CA)证书的公钥尝试,否则会错误接受签名并削弱
+		// EE 证书绑定。
 		if c.peerCert == nil || c.peerCert.PublicKey == nil {
 			return errors.New("gmtls: no peer certificate for signature verification")
 		}
 		signed := tls13CertVerifySigned(context, transcriptHash)
 
-		verifyWithPub := func(pub *PublicKey) (bool, error) {
-			// RFC 8998 §3.2.1: TLS 1.3 CertificateVerify 的 SM2 签名使用
-			// HANDSHAKE_SM2_ID ("TLSv1.3+GM+Cipher+Suite"),与 Tongsuo/BabaSSL
-			// 在 tls_construct_cert_verify 中通过 EVP_PKEY_CTX_set1_id 设置的 ID 一致。
-			// 注意:CERTVRIFY_SM2_ID ("1234567812345678") 仅用于 X.509 证书链签名验证,
-			// 不能用于 CertificateVerify 消息本身。
-			ok, err := sm2TLS13VerifyWithID(pub, signed, msg.Signature, sm2TLS13HandshakeID())
-			if err != nil {
-				return false, err
-			}
-			if ok {
-				return true, nil
-			}
-			// Fallback: 极少数历史非标准服务器可能用 CERTVRIFY ID 签名。
-			if altOk, altErr := sm2TLS13VerifyWithID(pub, signed, msg.Signature, sm2TLS13CertVerifyID()); altErr != nil {
-				return false, altErr
-			} else if altOk {
-				return true, nil
-			}
-			// Fallback: 一些服务器对 SM3(msg) 做 ECDSA 风格签名(不含 ZA,非标准)。
-			if VerifyMessageNoZA(pub, signed, sig) {
-				c.tls13SM2NoZA = true
-				return true, nil
-			}
-			return false, nil
-		}
-
-		valid, err := verifyWithPub(c.peerCert.PublicKey)
+		// RFC 8998 §3.2.1: TLS 1.3 CertificateVerify 的 SM2 签名使用
+		// HANDSHAKE_SM2_ID ("TLSv1.3+GM+Cipher+Suite"),与 Tongsuo/BabaSSL
+		// 在 tls_construct_cert_verify 中通过 EVP_PKEY_CTX_set1_id 设置的 ID 一致。
+		// 注意:CERTVRIFY_SM2_ID ("1234567812345678") 仅用于 X.509 证书链签名验证,
+		// 不能用于 CertificateVerify 消息本身。
+		valid, err := sm2TLS13VerifyWithID(c.peerCert.PublicKey, signed, msg.Signature, sm2TLS13HandshakeID())
 		if err != nil {
 			return err
-		}
-		if !valid && len(c.peerCert.Chain) > 1 {
-			for _, certDER := range c.peerCert.Chain {
-				pub, err := ParseSM2PublicKeyFromCertificate(certDER)
-				if err != nil {
-					continue
-				}
-				if pub.X.Cmp(c.peerCert.PublicKey.X) == 0 && pub.Y.Cmp(c.peerCert.PublicKey.Y) == 0 {
-					continue
-				}
-				ok, err := verifyWithPub(pub)
-				if err != nil {
-					return err
-				}
-				if ok {
-					c.peerCert.PublicKey = pub
-					valid = true
-					break
-				}
-			}
 		}
 		if !valid {
 			return errors.New("gmtls: CertificateVerify signature verification failed")
@@ -2126,9 +2111,7 @@ func (c *Conn) readClientHelloTLS13() error {
 	} else {
 		serverSuites = []uint16{
 			TLS_SM4_GCM_SM3_ALT,
-			TLS_SM4_CCM_SM3_ALT,
 			TLS_SM4_GCM_SM3,
-			TLS_SM4_CCM_SM3,
 		}
 	}
 	c.cipherSuite = selectCipherSuite(hello.CipherSuites, serverSuites, VersionTLS13, c.clientSupportedCurves, c.clientSigSchemes)
@@ -2190,7 +2173,10 @@ func (c *Conn) sendServerHelloTLS13() error {
 		if err != nil {
 			return fmt.Errorf("gmtls: failed to parse client SM2 public key: %v", err)
 		}
-		sharedSecret = DeriveSM2ECDHSharedSecret(sm2PrivKey, clientPubKey)
+		sharedSecret, err = DeriveSM2ECDHSharedSecret(sm2PrivKey, clientPubKey)
+		if err != nil {
+			return fmt.Errorf("gmtls: failed to derive SM2 shared secret: %v", err)
+		}
 		if c.tls13KeyMaterial == nil {
 			c.tls13KeyMaterial = &TLS13KeyMaterial{}
 		}
@@ -2284,7 +2270,7 @@ func (c *Conn) sendEncryptedExtensions() error {
 // sendCertificateTLS13 发送 TLS 1.3 Certificate
 func (c *Conn) sendCertificateTLS13() error {
 	if c.localCert == nil {
-		return errors.New("gmtls: missing client certificate")
+		return errors.New("gmtls: missing local certificate")
 	}
 	data := marshalCertificateTLS13(c.localCert, c.tls13CertReqContext)
 

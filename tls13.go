@@ -168,23 +168,15 @@ func DeriveMasterSecret(handshakeSecret []byte) []byte {
 	return SM3HKDFExtract(zeroKey, derivedSecret)
 }
 
-// DeriveTrafficKeys 派生流量密钥
-// 返回 key 和 iv
-// TLS 1.3: key 和 IV 使用不同的标签派生
-func DeriveTrafficKeys(secret []byte, unusedLabel []byte, keyLen int, ivLen int) ([]byte, []byte) {
-	// 根据TLS 1.3 RFC 8446:
+// DeriveTrafficKeys 派生流量密钥,返回 key 和 iv。
+// RFC 8446 §7.3:key 和 iv 分别用固定标签 "key"/"iv" 派生,与第二个参数无关
+// (保留该参数仅为兼容旧调用点,实际被忽略)。
+func DeriveTrafficKeys(secret []byte, _ []byte, keyLen int, ivLen int) ([]byte, []byte) {
 	// key = HKDF-Expand-Label(Secret, "key", "", key_length)
-	// iv = HKDF-Expand-Label(Secret, "iv", "", iv_length)
-
-	// Context 应该是空字节数组
+	// iv  = HKDF-Expand-Label(Secret, "iv",  "", iv_length)
 	context := []byte{}
-
-	// 使用 "key" 标签派生密钥
 	key := SM3HKDFExpandLabel(secret, "key", context, keyLen)
-
-	// 使用 "iv" 标签派生IV
 	iv := SM3HKDFExpandLabel(secret, "iv", context, ivLen)
-
 	return key, iv
 }
 

@@ -56,17 +56,18 @@ type Signature struct {
 	R, S *big.Int
 }
 
-func parseSM2Signature(derOrRaw []byte) (*Signature, error) {
-	if len(derOrRaw) == 64 {
-		r := new(big.Int).SetBytes(derOrRaw[:32])
-		s := new(big.Int).SetBytes(derOrRaw[32:])
-		return &Signature{R: r, S: s}, nil
-	}
-	return signatureFromASN1(derOrRaw)
-}
-
 func validSignatureInput(pub *PublicKey, sig *Signature) bool {
 	return pub != nil && sig != nil && sig.R != nil && sig.S != nil
+}
+
+// isAllZero 报告 b 是否全为零字节。用于 ECDHE 共享密钥的全零检查(RFC 8446 §7.4.1)。
+func isAllZero(b []byte) bool {
+	for _, x := range b {
+		if x != 0 {
+			return false
+		}
+	}
+	return true
 }
 
 // GenerateKey 生成 SM2 密钥对。
@@ -223,12 +224,17 @@ func DeriveSharedKey(priv *PrivateKey, pub *PublicKey) []byte {
 }
 
 // DeriveSM2ECDHSharedSecret 派生 SM2 ECDH 共享密钥（用于 TLS 1.3）。
-func DeriveSM2ECDHSharedSecret(priv *PrivateKey, pub *PublicKey) []byte {
+// 返回共享点 X 坐标(32 字节大端)。RFC 8446 §7.4.1 要求:若结果全零(如对端公钥
+// 为无穷远点/低阶点)必须视为错误并中止握手。
+func DeriveSM2ECDHSharedSecret(priv *PrivateKey, pub *PublicKey) ([]byte, error) {
 	x, _ := SM2Curve.ScalarMult(pub.X, pub.Y, priv.D.Bytes())
 	xBytes := x.Bytes()
 	result := make([]byte, 32)
 	copy(result[32-len(xBytes):], xBytes)
-	return result
+	if isAllZero(result) {
+		return nil, errors.New("gmtls: SM2 ECDH shared secret is all-zero (invalid peer public key)")
+	}
+	return result, nil
 }
 
 // GenerateSM2KeyPairForTLS13 生成 SM2 密钥对（用于 TLS 1.3 key_share）。

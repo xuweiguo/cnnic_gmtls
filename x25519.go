@@ -2,6 +2,7 @@ package gmtls
 
 import (
 	"crypto/rand"
+	"errors"
 	"io"
 
 	"golang.org/x/crypto/curve25519"
@@ -53,6 +54,11 @@ func DeriveX25519SharedSecret(privateKey, peerPublicKey []byte) ([]byte, error) 
 	copy(pubKeyArr[:], peerPublicKey)
 
 	curve25519.ScalarMult(sharedSecret, privKeyArr, pubKeyArr)
+
+	// RFC 8446 §7.4.1 / RFC 7748 §6.1:全零共享密钥(低阶输入导致)必须视为错误。
+	if isAllZero(sharedSecret[:]) {
+		return nil, errors.New("gmtls: X25519 shared secret is all-zero (invalid peer public key)")
+	}
 
 	return sharedSecret[:], nil
 }
